@@ -6294,7 +6294,20 @@ def _sm_secret_create(logical_id, props, stack_name):
     }
     if props.get("ReplicaRegions"):
         _sm_secret_replicate(name, props["ReplicaRegions"])
-    return name, {"Id": arn, "Arn": arn}
+    # Ref of AWS::SecretsManager::Secret is the secret's ARN
+    # (aws-resource-secretsmanager-secret, "Return values"); the service
+    # resolves a secret by name or ARN, so the ARN is the physical id the
+    # update and delete below look it up by.
+    return arn, {"Id": arn, "Arn": arn}
+
+
+def _sm_secret_lookup(physical_id):
+    """The stored secret behind a physical id — the ARN a stack created it
+    under, or the name a stack created before this returned the ARN."""
+    key, secret = _sm._resolve(physical_id)
+    if secret is None:
+        return physical_id, None
+    return key, secret
 
 
 def _sm_secret_replicate(secret_id, regions):
@@ -6319,8 +6332,8 @@ def _sm_secret_update(physical_id, old_props, new_props, stack_name, logical_id=
     ReplicateSecretToRegions. Type is not stored by the service and is
     ignored.
     """
-    name = new_props.get("Name") or _physical_name(stack_name, logical_id or physical_id)
-    secret = _sm._secrets.get(physical_id)
+    key, secret = _sm_secret_lookup(physical_id)
+    name = new_props.get("Name") or _physical_name(stack_name, logical_id or key)
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
         name, secret.get("Name") if secret else None, _sm_secret_create, _sm_secret_delete,
@@ -6328,7 +6341,7 @@ def _sm_secret_update(physical_id, old_props, new_props, stack_name, logical_id=
     if replaced is not None:
         return replaced
 
-    data = {"SecretId": physical_id}
+    data = {"SecretId": key}
     # Sent only when the template speaks to the property: declared, or
     # dropped since the previous template, which clears it as
     # CloudFormation does. A value set outside the stack on a property
@@ -6347,15 +6360,15 @@ def _sm_secret_update(physical_id, old_props, new_props, stack_name, logical_id=
         # Regions added or re-keyed since the previous template are applied;
         # a region dropped from the template keeps its replica, the service
         # has no RemoveRegionsFromReplication to take it down with.
-        _sm_secret_replicate(physical_id, new_props["ReplicaRegions"])
-    return physical_id, {"Id": secret["ARN"], "Arn": secret["ARN"]}
+        _sm_secret_replicate(key, new_props["ReplicaRegions"])
+    return secret["ARN"], {"Id": secret["ARN"], "Arn": secret["ARN"]}
 
 
 def _sm_secret_delete(physical_id, props):
-    secret = _sm._secrets.get(physical_id)
+    key, secret = _sm_secret_lookup(physical_id)
     if secret is not None:
         # Takes the replicas and the resource policy down with the secret.
-        _sm._purge_secret(physical_id, secret)
+        _sm._purge_secret(key, secret)
 
 
 # --- Cognito UserPool ---
