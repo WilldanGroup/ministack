@@ -1358,6 +1358,13 @@ def _extract_deps(resource_def: dict, all_resource_names: set) -> set:
                     base = var.split(".")[0]
                     if base in all_resource_names:
                         deps.add(base)
+                # The variable map's values are intrinsics of their own — a
+                # Ref or GetAtt of a sibling, as every CDK-synthesized
+                # ``Fn::Sub`` with a map carries — and each is a dependency.
+                # Unwalked, the sibling could be provisioned after this
+                # resource and its Ref resolve to the logical id.
+                if isinstance(sub_val, list) and len(sub_val) > 1:
+                    _walk(sub_val[1])
             # Walk ALL branches of Fn::If
             if "Fn::If" in obj:
                 args = obj["Fn::If"]
