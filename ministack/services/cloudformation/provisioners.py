@@ -4249,6 +4249,20 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
             )
             _add_event(child_stack_id, child_name, child_logical_id, resource_type,
                        f"{status_prefix}_FAILED", str(exc))
+            if not is_update:
+                # A child whose create failed never reaches the parent as a
+                # provisioned resource, so the parent's rollback cannot delete
+                # it; AWS deletes the failed child, and what it had created,
+                # as part of that rollback. Done here, before the failure
+                # propagates, so the next create of the parent finds none of
+                # the child's names taken.
+                _add_event(child_stack_id, child_name, child_name,
+                           "AWS::CloudFormation::Stack", "DELETE_IN_PROGRESS",
+                           physical_id=child_stack_id)
+                _cfn_nested_stack_delete(child_name, props)
+                _add_event(child_stack_id, child_name, child_name,
+                           "AWS::CloudFormation::Stack", "DELETE_COMPLETE",
+                           physical_id=child_stack_id)
             raise
 
         provisioned[child_logical_id] = {
