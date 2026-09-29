@@ -14546,6 +14546,75 @@ def test_cfn_nested_stack_basic(cfn, s3):
     s3.delete_bucket(Bucket=templates_bucket)
 
 
+def test_cfn_nested_stack_create_failure_deletes_what_the_child_created(cfn, s3, ssm):
+    """A child whose second resource fails to create is deleted with its first
+    one in the parent's rollback: the parameter the child created is gone, the
+    child reports DELETE_COMPLETE, and creating the same parent again with the
+    child fixed succeeds. The child never reached the parent as a provisioned
+    resource, so the rollback used to leave its resources behind and the next
+    create failed on the parameter's name."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    templates_bucket = f"cfn-nested-templates-{suffix}"
+    parent_name = f"cfn-nested-rollback-{suffix}"
+    parameter_name = f"/cfn-nested-rollback-{suffix}/first"
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    s3.create_bucket(Bucket=templates_bucket)
+
+    def child_template(broken):
+        resources = {
+            "First": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": parameter_name, "Type": "String", "Value": "one"}},
+        }
+        if broken:
+            resources["Second"] = {**_FAILING_RESOURCE, "DependsOn": ["First"]}
+        return {"AWSTemplateFormatVersion": "2010-09-09", "Resources": resources}
+
+    parent_template = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Child": {
+            "Type": "AWS::CloudFormation::Stack",
+            "Properties": {"TemplateURL": f"{endpoint}/{templates_bucket}/child.json"},
+        }},
+    })
+
+    def child_stacks():
+        return [s for s in _all_pages(cfn, "list_stacks", "StackSummaries")
+                if s["StackName"].startswith(f"{parent_name}-Child-")]
+
+    try:
+        s3.put_object(Bucket=templates_bucket, Key="child.json",
+                      Body=json.dumps(child_template(broken=True)).encode())
+        cfn.create_stack(StackName=parent_name, TemplateBody=parent_template)
+        stack = _wait_stack(cfn, parent_name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+
+        # The parameter the child created before its second resource failed
+        # went with the child.
+        with pytest.raises(ClientError) as exc:
+            ssm.get_parameter(Name=parameter_name)
+        assert exc.value.response["Error"]["Code"] == "ParameterNotFound"
+        children = child_stacks()
+        assert len(children) == 1, children
+        assert children[0]["StackStatus"] == "DELETE_COMPLETE"
+        assert cfn.describe_stacks(StackName=children[0]["StackId"])["Stacks"][0][
+            "StackStatus"] == "DELETE_COMPLETE"
+
+        # A ROLLBACK_COMPLETE stack is deleted before it can be created again.
+        cfn.delete_stack(StackName=parent_name)
+        _wait_stack(cfn, parent_name)
+
+        s3.put_object(Bucket=templates_bucket, Key="child.json",
+                      Body=json.dumps(child_template(broken=False)).encode())
+        cfn.create_stack(StackName=parent_name, TemplateBody=parent_template)
+        stack = _wait_stack(cfn, parent_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, parent_name)
+        assert ssm.get_parameter(Name=parameter_name)["Parameter"]["Value"] == "one"
+    finally:
+        _delete_cfn_test_stack(cfn, parent_name)
+        s3.delete_object(Bucket=templates_bucket, Key="child.json")
+        s3.delete_bucket(Bucket=templates_bucket)
+
+
 def test_cfn_nested_stack_long_name_lambda_functions_get_distinct_physical_names(cfn, s3, lam):
     """Regression test: a nested stack's own auto-generated name (parent name
     + nested-stack logical id + a CloudFormation-assigned suffix — exactly
