@@ -13,6 +13,9 @@ Supports:
   Resolvers:     CreateResolver, GetResolver, ListResolvers, DeleteResolver
   Types:         CreateType, ListTypes, GetType
   Tags:          TagResource, UntagResource, ListTagsForResource
+  Domain names:  CreateDomainName, GetDomainName, ListDomainNames,
+                 UpdateDomainName, DeleteDomainName, AssociateApi,
+                 GetApiAssociation, DisassociateApi
 
 Wire protocol:
   REST/JSON — path-based routing under /v1/apis.
@@ -57,6 +60,8 @@ _types = AccountRegionScopedDict()           # apiId -> {typeName -> type record
 _functions = AccountRegionScopedDict()       # apiId -> {functionId -> function record}
 _schemas = AccountRegionScopedDict()         # apiId -> {"definition": str, "status": str, "details": str}
 _caches = AccountRegionScopedDict()           # apiId -> ApiCache record
+_domain_names = AccountRegionScopedDict()     # domainName -> DomainNameConfig record
+_api_associations = AccountRegionScopedDict() # domainName -> ApiAssociation record
 # apiId -> {cache key -> (expires_at, value)}. Separate from _caches, which holds
 # the ApiCache configuration; this is the cached data itself. Not persisted: a
 # restart is a cold cache, as replacing the cache instance would be on AWS.
@@ -1047,6 +1052,10 @@ async def handle_request(method, path, headers, body, query_params):
             # the event loop waits on it. Run it on a worker thread.
             return await asyncio.to_thread(_execute_graphql, api_id, data, headers)
 
+    # Custom domain names: /v1/domainnames[/{domainName}[/apiassociation]]
+    if path == "/v1/domainnames" or path.startswith("/v1/domainnames/"):
+        return _route_domain_names(method, path, body)
+
     m = _PATH_RE.match(path)
     if not m:
         return error_response_json("NotFoundException", f"Unknown path: {path}", 404)
@@ -1205,6 +1214,146 @@ async def handle_request(method, path, headers, body, query_params):
 
 
 # ---------------------------------------------------------------------------
+# Domain names and API associations
+#
+# A custom domain is a record: the certificate is not checked and nothing
+# answers on the name, but the CloudFront-shaped appsyncDomainName and the
+# hosted zone id are what a template aliases a Route 53 record at, and the
+# association is what a client would resolve the domain to.
+# ---------------------------------------------------------------------------
+
+# CloudFront's hosted zone id: every AppSync custom domain is an alias into
+# the distribution AppSync fronts it with.
+_CLOUDFRONT_HOSTED_ZONE_ID = "Z2FDTNDATAQYW2"
+
+
+def _domain_name_arn(domain_name):
+    return f"arn:aws:appsync:{get_region()}:{get_account_id()}:domainnames/{domain_name}"
+
+
+def _domain_name_config(record):
+    out = dict(record)
+    tags = _tags.get(record["domainNameArn"])
+    if tags:
+        out["tags"] = dict(tags)
+    return out
+
+
+def _create_domain_name(body):
+    domain = body.get("domainName", "")
+    certificate_arn = body.get("certificateArn", "")
+    if not domain or not certificate_arn:
+        return error_response_json("BadRequestException",
+                                   "domainName and certificateArn are required", 400)
+    if domain in _domain_names:
+        return error_response_json("BadRequestException",
+                                   f"Domain name {domain} already exists", 400)
+    record = {
+        "domainName": domain,
+        "description": body.get("description", ""),
+        "certificateArn": certificate_arn,
+        # The fronting distribution's name, in CloudFront's shape.
+        "appsyncDomainName": "d" + new_uuid().replace("-", "")[:13] + ".cloudfront.net",
+        "hostedZoneId": _CLOUDFRONT_HOSTED_ZONE_ID,
+        "domainNameArn": _domain_name_arn(domain),
+    }
+    _domain_names[domain] = record
+    tags = body.get("tags") or {}
+    if tags:
+        _tags[record["domainNameArn"]] = dict(tags)
+    return _json(200, {"domainNameConfig": _domain_name_config(record)})
+
+
+def _get_domain_name(domain):
+    record = _domain_names.get(domain)
+    if record is None:
+        return error_response_json("NotFoundException", f"Domain name {domain} not found", 404)
+    return _json(200, {"domainNameConfig": _domain_name_config(record)})
+
+
+def _list_domain_names():
+    return _json(200, {"domainNameConfigs": [_domain_name_config(r) for r in _domain_names.values()]})
+
+
+def _update_domain_name(domain, body):
+    record = _domain_names.get(domain)
+    if record is None:
+        return error_response_json("NotFoundException", f"Domain name {domain} not found", 404)
+    if "description" in body:
+        record["description"] = body["description"]
+    return _json(200, {"domainNameConfig": _domain_name_config(record)})
+
+
+def _delete_domain_name(domain):
+    record = _domain_names.get(domain)
+    if record is None:
+        return error_response_json("NotFoundException", f"Domain name {domain} not found", 404)
+    if domain in _api_associations:
+        return error_response_json("BadRequestException",
+                                   f"Domain name {domain} is associated with an API", 400)
+    del _domain_names[domain]
+    _tags.pop(record["domainNameArn"], None)
+    return _json(200, {})
+
+
+def _associate_api(domain, body):
+    if domain not in _domain_names:
+        return error_response_json("NotFoundException", f"Domain name {domain} not found", 404)
+    api_id = body.get("apiId", "")
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+    association = {"domainName": domain, "apiId": api_id, "associationStatus": "SUCCESS"}
+    _api_associations[domain] = association
+    return _json(200, {"apiAssociation": dict(association)})
+
+
+def _get_api_association(domain):
+    association = _api_associations.get(domain)
+    if association is None:
+        return error_response_json("NotFoundException",
+                                   f"Domain name {domain} has no API association", 404)
+    return _json(200, {"apiAssociation": dict(association)})
+
+
+def _disassociate_api(domain):
+    if domain not in _domain_names:
+        return error_response_json("NotFoundException", f"Domain name {domain} not found", 404)
+    _api_associations.pop(domain, None)
+    return _json(200, {})
+
+
+def _route_domain_names(method, path, body):
+    from urllib.parse import unquote
+    parts = [unquote(p) for p in path[len("/v1/domainnames"):].split("/") if p]
+    data = {}
+    if body:
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            data = {}
+    if not parts:
+        if method == "POST":
+            return _create_domain_name(data)
+        if method == "GET":
+            return _list_domain_names()
+    elif len(parts) == 1:
+        if method == "GET":
+            return _get_domain_name(parts[0])
+        if method == "POST":
+            return _update_domain_name(parts[0], data)
+        if method == "DELETE":
+            return _delete_domain_name(parts[0])
+    elif len(parts) == 2 and parts[1] == "apiassociation":
+        if method == "POST":
+            return _associate_api(parts[0], data)
+        if method == "GET":
+            return _get_api_association(parts[0])
+        if method == "DELETE":
+            return _disassociate_api(parts[0])
+    return error_response_json("BadRequestException", f"Unsupported route: {method} {path}")
+
+
+# ---------------------------------------------------------------------------
 # State management
 # ---------------------------------------------------------------------------
 
@@ -1218,6 +1367,8 @@ def reset():
     _functions.clear()
     _schemas.clear()
     _caches.clear()
+    _domain_names.clear()
+    _api_associations.clear()
     with _cache_entries_lock:
         _cache_entries.clear()
     # Drop the JS workers so their compiled-module cache does not outlive a
@@ -1239,6 +1390,8 @@ def get_state():
         "functions": _functions,
         "schemas": _schemas,
         "caches": _caches,
+        "domain_names": _domain_names,
+        "api_associations": _api_associations,
         "tags": _tags,
     })
 
@@ -1265,6 +1418,8 @@ def _restore_state(data):
         (_caches, "caches"),
     ):
         _restore_api_child_store(store, data.get(key, {}), api_regions)
+    _domain_names.update(data.get("domain_names", {}))
+    _api_associations.update(data.get("api_associations", {}))
     _tags.update(data.get("tags", {}))
 
 
