@@ -735,6 +735,25 @@ class TestTrustPolicy:
         assert evaluate_trust_policy(trust, "arn:aws:iam::123456789012:user/alice")
         assert not evaluate_trust_policy(trust, "arn:aws:iam::123456789012:user/bob")
 
+    def test_role_principal_admits_that_roles_sessions(self):
+        """A role ARN as principal trusts the role's assumed-role sessions
+        (arn:aws:sts::ACCT:assumed-role/Name/Session), the caller a function
+        running under that role presents — and no other role's."""
+        trust = {"Statement": [{"Effect": "Allow",
+                                "Principal": {"AWS": "arn:aws:iam::123456789012:role/switchboard-function"},
+                                "Action": "sts:AssumeRole"}]}
+        assert evaluate_trust_policy(
+            trust, "arn:aws:sts::123456789012:assumed-role/switchboard-function/workflow-dispatcher")
+        assert not evaluate_trust_policy(
+            trust, "arn:aws:sts::123456789012:assumed-role/other-function/workflow-dispatcher")
+        assert not evaluate_trust_policy(
+            trust, "arn:aws:sts::999999999999:assumed-role/switchboard-function/workflow-dispatcher")
+        with_path = {"Statement": [{"Effect": "Allow",
+                                    "Principal": {"AWS": "arn:aws:iam::123456789012:role/service/switchboard-function"},
+                                    "Action": "sts:AssumeRole"}]}
+        assert evaluate_trust_policy(
+            with_path, "arn:aws:sts::123456789012:assumed-role/switchboard-function/s")
+
     def test_service_principal_allows_root(self):
         """Service principals allow root (MiniStack's internal service calls use root)."""
         trust = {"Statement": [{"Effect": "Allow",
