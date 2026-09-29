@@ -2412,6 +2412,7 @@ async def _dispatch_service_request(
             eventbridge_resource_arns,
             extract_iam_action,
             extract_resource_arn,
+            kms_resource_arns,
         )
         from ministack.core.iam_evaluator import AuthError, enforce, pin_request_caller
         from ministack.core.responses import get_account_id
@@ -2462,6 +2463,16 @@ async def _dispatch_service_request(
             if service == "events" and not denied:
                 for extra_arn in eventbridge_resource_arns(
                         body, region, get_account_id())[1:]:
+                    denied = enforce(
+                        access_key, iam_action, service, region,
+                        resource_arn=extra_arn,
+                    )
+                    if denied:
+                        break
+            # An alias call is authorized against the key it names and the
+            # alias itself; both must be allowed.
+            if service == "kms" and not denied:
+                for extra_arn in kms_resource_arns(body, region, get_account_id())[1:]:
                     denied = enforce(
                         access_key, iam_action, service, region,
                         resource_arn=extra_arn,

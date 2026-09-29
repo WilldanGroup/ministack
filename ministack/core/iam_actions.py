@@ -940,20 +940,8 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "kms":
-        key_id = _safe_json_field(body, "KeyId")
-        if not key_id:
-            # Decrypt, and ReEncrypt's source key, carry no KeyId for symmetric
-            # keys — the key is recovered from the ciphertext.
-            key_id = _kms_key_id_from_ciphertext(
-                _safe_json_field(body, "CiphertextBlob"))
-        if key_id:
-            # KeyId can be an ARN, alias, or key ID
-            if key_id.startswith("arn:"):
-                return key_id
-            if key_id.startswith("alias/"):
-                return f"arn:aws:kms:{region}:{account_id}:{key_id}"
-            return f"arn:aws:kms:{region}:{account_id}:key/{key_id}"
-        return "*"
+        resources = kms_resource_arns(body, region, account_id)
+        return resources[0] if resources else "*"
 
     if service == "secretsmanager":
         secret_id = _safe_json_field(body, "SecretId")
@@ -1637,6 +1625,38 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     return "*"
+
+
+def _kms_arn(key_id: str, region: str, account_id: str) -> str:
+    """A KMS ARN from what a request names: an ARN as given, an alias name or
+    a key id under the request's region and account."""
+    if key_id.startswith("arn:"):
+        return key_id
+    if key_id.startswith("alias/"):
+        return f"arn:aws:kms:{region}:{account_id}:{key_id}"
+    return f"arn:aws:kms:{region}:{account_id}:key/{key_id}"
+
+
+def kms_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
+    """Every resource a KMS call is authorized against, the key first.
+
+    Most calls name their key as KeyId; Decrypt, and ReEncrypt's source key,
+    carry none for a symmetric key and the key is recovered from the
+    ciphertext. The alias calls — CreateAlias, UpdateAlias — name the key as
+    TargetKeyId and the alias as AliasName, and AWS authorizes them against
+    both (kms:CreateAlias on the alias ARN and on the key ARN, per the KMS
+    permissions reference); DeleteAlias names the alias alone.
+    """
+    arns: list[str] = []
+    key_id = _safe_json_field(body, "KeyId") or _safe_json_field(body, "TargetKeyId")
+    if not key_id:
+        key_id = _kms_key_id_from_ciphertext(_safe_json_field(body, "CiphertextBlob"))
+    if key_id:
+        arns.append(_kms_arn(key_id, region, account_id))
+    alias_name = _safe_json_field(body, "AliasName")
+    if alias_name:
+        arns.append(_kms_arn(alias_name, region, account_id))
+    return arns
 
 
 def eventbridge_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
