@@ -8685,6 +8685,54 @@ def test_cfn_codebuild_project_basic(cfn, codebuild):
     assert len(result["projects"]) == 0
 
 
+def test_cfn_codebuild_project_reads_back_in_the_api_shape(cfn, codebuild):
+    """A project a stack declares reads back through BatchGetProjects with its
+    source, its inline buildspec and its environment variables in the API's
+    shape, on create and after an update — what StartBuild runs."""
+    def template(buildspec, value):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"Project": {
+                "Type": "AWS::CodeBuild::Project",
+                "Properties": {
+                    "Name": "cfn-cb-shape",
+                    "Source": {"Type": "NO_SOURCE", "BuildSpec": buildspec},
+                    "Artifacts": {"Type": "NO_ARTIFACTS"},
+                    "Environment": {
+                        "Type": "LINUX_CONTAINER",
+                        "Image": "aws/codebuild/standard:7.0",
+                        "ComputeType": "BUILD_GENERAL1_SMALL",
+                        "PrivilegedMode": True,
+                        "EnvironmentVariables": [
+                            {"Name": "GITHUB_HOST", "Type": "PLAINTEXT", "Value": value},
+                        ],
+                    },
+                    "ServiceRole": "arn:aws:iam::000000000000:role/codebuild-role",
+                },
+            }},
+        })
+
+    first = "version: 0.2\nphases:\n  build:\n    commands:\n      - echo one\n"
+    second = first.replace("one", "two")
+    try:
+        cfn.create_stack(StackName="cfn-cb-shape", TemplateBody=template(first, "https://github.com"))
+        assert _wait_stack(cfn, "cfn-cb-shape")["StackStatus"] == "CREATE_COMPLETE"
+        project = codebuild.batch_get_projects(names=["cfn-cb-shape"])["projects"][0]
+        assert project["source"] == {"type": "NO_SOURCE", "buildspec": first}
+        assert project["artifacts"] == {"type": "NO_ARTIFACTS"}
+        assert project["environment"]["privilegedMode"] is True
+        assert project["environment"]["environmentVariables"] == [
+            {"name": "GITHUB_HOST", "type": "PLAINTEXT", "value": "https://github.com"}]
+
+        cfn.update_stack(StackName="cfn-cb-shape", TemplateBody=template(second, "http://host:1"))
+        assert _wait_stack(cfn, "cfn-cb-shape")["StackStatus"] == "UPDATE_COMPLETE"
+        project = codebuild.batch_get_projects(names=["cfn-cb-shape"])["projects"][0]
+        assert project["source"]["buildspec"] == second
+        assert project["environment"]["environmentVariables"][0]["value"] == "http://host:1"
+    finally:
+        _delete_cfn_test_stack(cfn, "cfn-cb-shape")
+
+
 def test_cfn_codebuild_project_auto_name(cfn, codebuild):
     """When Name is omitted, _physical_name() generates one."""
     template = {
