@@ -14674,6 +14674,89 @@ def test_cfn_nested_stack_create_failure_deletes_what_the_child_created(cfn, s3,
         s3.delete_bucket(Bucket=templates_bucket)
 
 
+_CR_HANDLER_DATA = """\
+import json, urllib.request
+
+def handler(event, context):
+    payload = json.dumps({
+        "Status": "SUCCESS",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": "replica-" + event["ResourceProperties"]["Name"],
+        "Data": {"ReplicaArn": "arn:aws:kms:us-west-2:000000000000:key/mrk-" + event["ResourceProperties"]["Name"]},
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"], data=payload, method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+def test_cfn_nested_stack_update_keeps_an_unchanged_custom_resources_data(cfn, s3, ssm, lam):
+    """A child holds a custom resource whose Data a sibling reads through
+    Fn::GetAtt. The parent is updated to a new TemplateURL of the same child
+    (a release publishes every template under a new version) with an unrelated
+    change: the custom resource is unchanged and is not re-invoked, and the
+    sibling's GetAtt still resolves to the Data the create returned, as on
+    AWS, where a custom resource's attributes persist until an Update re-invokes it."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    templates_bucket = f"cfn-nested-data-{suffix}"
+    parent_name = f"cfn-nested-data-{suffix}"
+    fn_name = f"cr-data-{suffix}"
+    parameter_name = f"/cfn-nested-data-{suffix}/arn"
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    s3.create_bucket(Bucket=templates_bucket)
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12", Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DATA)},
+    )
+
+    def child_template(marker):
+        return {"AWSTemplateFormatVersion": "2010-09-09", "Resources": {
+            "Replica": {"Type": "Custom::KeyReplica", "Properties": {
+                "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn_name}",
+                "Name": suffix}},
+            "Reader": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": parameter_name, "Type": "String",
+                "Value": {"Fn::GetAtt": ["Replica", "ReplicaArn"]},
+                "Description": marker}},
+        }, "Outputs": {"ReplicaArn": {"Value": {"Fn::GetAtt": ["Replica", "ReplicaArn"]}}}}
+
+    def parent_template(version):
+        return json.dumps({"AWSTemplateFormatVersion": "2010-09-09", "Resources": {"Child": {
+            "Type": "AWS::CloudFormation::Stack",
+            "Properties": {"TemplateURL": f"{endpoint}/{templates_bucket}/{version}/child.json"},
+        }}, "Outputs": {"Arn": {"Value": {"Fn::GetAtt": ["Child", "Outputs.ReplicaArn"]}}}})
+
+    try:
+        s3.put_object(Bucket=templates_bucket, Key="v1/child.json",
+                      Body=json.dumps(child_template("one")).encode())
+        cfn.create_stack(StackName=parent_name, TemplateBody=parent_template("v1"))
+        stack = _wait_stack(cfn, parent_name, timeout=60)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, parent_name)
+        arn = f"arn:aws:kms:us-west-2:000000000000:key/mrk-{suffix}"
+        assert ssm.get_parameter(Name=parameter_name)["Parameter"]["Value"] == arn
+
+        s3.put_object(Bucket=templates_bucket, Key="v2/child.json",
+                      Body=json.dumps(child_template("two")).encode())
+        cfn.update_stack(StackName=parent_name, TemplateBody=parent_template("v2"))
+        stack = _wait_stack(cfn, parent_name, timeout=60)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, parent_name)
+        assert stack["Outputs"][0]["OutputValue"] == arn
+        assert ssm.get_parameter(Name=parameter_name)["Parameter"]["Value"] == arn
+        child = cfn.describe_stack_resource(StackName=parent_name, LogicalResourceId="Child")[
+            "StackResourceDetail"]["PhysicalResourceId"]
+        assert cfn.describe_stacks(StackName=child)["Stacks"][0]["StackStatus"] == "UPDATE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, parent_name)
+        for key in ("v1/child.json", "v2/child.json"):
+            s3.delete_object(Bucket=templates_bucket, Key=key)
+        s3.delete_bucket(Bucket=templates_bucket)
+        lam.delete_function(FunctionName=fn_name)
+
+
 def test_cfn_nested_stack_long_name_lambda_functions_get_distinct_physical_names(cfn, s3, lam):
     """Regression test: a nested stack's own auto-generated name (parent name
     + nested-stack logical id + a CloudFormation-assigned suffix — exactly
