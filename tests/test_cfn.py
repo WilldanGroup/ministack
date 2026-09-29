@@ -2470,6 +2470,65 @@ def test_cfn_multi_resource_dependencies(cfn, iam, lam):
     func = lam.get_function(FunctionName="cfn-t07-func")["Configuration"]
     assert func["Role"] == role["Arn"]
 
+def test_cfn_fn_sub_variable_map_orders_the_resources(cfn, iam, ddb):
+    """A Ref or Fn::GetAtt inside an Fn::Sub variable map is a dependency: the
+    role, whose logical id sorts before the table's and which carries no
+    DependsOn, is provisioned after the table, so its policy names the table
+    by its real name and ARN. Unwalked, the role went first and the Ref
+    resolved to the logical id: a grant on table/Tbl that matched nothing."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sub-map-{uid}"
+    role_name = f"cfn-sub-map-role-{uid}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "ARole": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "RoleName": role_name,
+                    "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [{
+                        "Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},
+                        "Action": "sts:AssumeRole"}]},
+                    "Policies": [
+                        {"PolicyName": "TableByRef", "PolicyDocument": {"Statement": [{
+                            "Effect": "Allow", "Action": "dynamodb:GetItem",
+                            "Resource": {"Fn::Sub": [
+                                "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}",
+                                {"TableName": {"Ref": "Tbl"}}]}}]}},
+                        {"PolicyName": "TableByArn", "PolicyDocument": {"Statement": [{
+                            "Effect": "Allow", "Action": "dynamodb:PutItem",
+                            "Resource": {"Fn::Sub": ["${Arn}", {"Arn": {"Fn::GetAtt": ["Tbl", "Arn"]}}]}}]}},
+                    ],
+                },
+            },
+            "Tbl": {
+                "Type": "AWS::DynamoDB::Table",
+                "Properties": {
+                    "TableName": {"Fn::Sub": "${AWS::StackName}-tbl"},
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "BillingMode": "PAY_PER_REQUEST",
+                },
+            },
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        table_arn = ddb.describe_table(TableName=f"{stack_name}-tbl")["Table"]["TableArn"]
+
+        def resource(policy_name):
+            doc = iam.get_role_policy(RoleName=role_name, PolicyName=policy_name)["PolicyDocument"]
+            return doc["Statement"][0]["Resource"]
+
+        assert resource("TableByRef").endswith(f":table/{stack_name}-tbl")
+        assert not resource("TableByRef").endswith(":table/Tbl")
+        assert resource("TableByArn") == table_arn
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_change_set_lifecycle(cfn):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",
