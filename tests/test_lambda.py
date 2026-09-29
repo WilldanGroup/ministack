@@ -10521,6 +10521,40 @@ def test_rewrite_host_for_container_rewrites_localhost():
     assert rw("") == ""
 
 
+def test_rewrite_urls_for_container_reaches_every_url_in_the_event():
+    """Every localhost URL ministack minted, wherever the event carries it —
+    top level, nested under a custom resource's ResourceProperties, in a list
+    — is rewritten to host.docker.internal; a URL to another host, a plain
+    string that merely mentions localhost, numbers and None are returned as
+    they were."""
+    from ministack.services.lambda_svc import _rewrite_urls_for_container as rw
+
+    signal = "http://localhost:4566/_ministack/cfn-signal/abc"
+    rewritten = "http://host.docker.internal:4566/_ministack/cfn-signal/abc"
+    event = {
+        "ResponseURL": signal,
+        "ResourceProperties": {"IssuedSignalUrl": signal, "Count": 2, "Note": None},
+        "Urls": [signal, "https://api.github.com/x", 7],
+        "Upstream": "https://api.github.com/x",
+        "Text": "the localhost:4566 endpoint, in words",
+    }
+    assert rw(event) == {
+        "ResponseURL": rewritten,
+        "ResourceProperties": {"IssuedSignalUrl": rewritten, "Count": 2, "Note": None},
+        "Urls": [rewritten, "https://api.github.com/x", 7],
+        "Upstream": "https://api.github.com/x",
+        "Text": "the localhost:4566 endpoint, in words",
+    }
+    # The scalars alone, as a state machine may hand a bare input.
+    assert rw(signal) == rewritten
+    assert rw("https://api.github.com/x") == "https://api.github.com/x"
+    assert rw("localhost is not a URL") == "localhost is not a URL"
+    assert rw(7) == 7
+    assert rw(None) is None
+    # The event itself is not changed in place.
+    assert event["ResponseURL"] == signal
+
+
 def test_invoke_rie_rewrites_custom_resource_response_url():
     """Regression for #1149: a docker-executed custom resource's ResponseURL
     (default localhost) must be rewritten to host.docker.internal before the
