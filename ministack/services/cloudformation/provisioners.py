@@ -7007,6 +7007,24 @@ def _ecr_repo_delete(physical_id, props):
 
 # --- CodeBuild Project provisioner ---
 
+def _codebuild_members(value):
+    """A project member as the CodeBuild API holds it. The template's
+    PascalCase keys are the API's camelCase ones — ``Type`` is ``type``,
+    ``EnvironmentVariables`` a list of ``name``/``value``/``type`` — with one
+    exception the API spells in lower case throughout, ``buildspec``. Without
+    this a project a stack created read back with no source, no environment
+    variables and no buildspec, and a build of it had nothing to run."""
+    if isinstance(value, dict):
+        return {
+            ("buildspec" if k == "BuildSpec" else k[:1].lower() + k[1:] if k else k):
+                _codebuild_members(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_codebuild_members(v) for v in value]
+    return value
+
+
 def _codebuild_project_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=255)
     
@@ -7017,14 +7035,14 @@ def _codebuild_project_create(logical_id, props, stack_name):
     data = {
         "name": name,
         "description": props.get("Description", ""),
-        "source": props.get("Source", {"type": "NO_SOURCE"}),
+        "source": _codebuild_members(props.get("Source", {"Type": "NO_SOURCE"})),
         "sourceVersion": props.get("SourceVersion", ""),
-        "artifacts": props.get("Artifacts", {"type": "NO_ARTIFACTS"}),
-        "environment": props.get("Environment", {
-            "type": "LINUX_CONTAINER",
-            "image": "aws/codebuild/standard:7.0",
-            "computeType": "BUILD_GENERAL1_SMALL",
-        }),
+        "artifacts": _codebuild_members(props.get("Artifacts", {"Type": "NO_ARTIFACTS"})),
+        "environment": _codebuild_members(props.get("Environment", {
+            "Type": "LINUX_CONTAINER",
+            "Image": "aws/codebuild/standard:7.0",
+            "ComputeType": "BUILD_GENERAL1_SMALL",
+        })),
         "serviceRole": props.get("ServiceRole", f"arn:aws:iam::{get_account_id()}:role/codebuild-role"),
         "timeoutInMinutes": int(props.get("TimeoutInMinutes", 60)),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
@@ -12270,7 +12288,8 @@ def _codebuild_project_update(physical_id, old_props, new_props, stack_name):
                       ("SourceVersion", "sourceVersion"), ("Artifacts", "artifacts"),
                       ("Environment", "environment"), ("ServiceRole", "serviceRole")):
         if prop in new_props:
-            project[key] = new_props[prop]
+            value = new_props[prop]
+            project[key] = _codebuild_members(value) if isinstance(value, dict) else value
     if "TimeoutInMinutes" in new_props:
         project["timeoutInMinutes"] = int(new_props["TimeoutInMinutes"])
     _reconcile_tag_list(project.setdefault("tags", []), old_props, new_props,
