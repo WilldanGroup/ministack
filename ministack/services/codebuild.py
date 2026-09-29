@@ -7,6 +7,8 @@ JSON-based API via X-Amz-Target: CodeBuild_20161006.<Operation>.
 Supports:
   Projects:  CreateProject, BatchGetProjects, ListProjects,
              UpdateProject, DeleteProject
+  Fleets:    CreateFleet, BatchGetFleets, ListFleets,
+             UpdateFleet, DeleteFleet
   Builds:    StartBuild, BatchGetBuilds, StopBuild,
              ListBuilds, ListBuildsForProject, BatchDeleteBuilds
 
@@ -49,11 +51,13 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # ---------------------------------------------------------------------------
 _projects = AccountRegionScopedDict()    # project_name -> project record
 _builds = AccountRegionScopedDict()      # build_id -> build record
+_fleets = AccountRegionScopedDict()      # fleet arn -> fleet record
 
 
 def reset():
     _projects.clear()
     _builds.clear()
+    _fleets.clear()
     with _stopped_lock:
         _stopped_builds.clear()
 
@@ -62,6 +66,7 @@ def get_state():
     return copy.deepcopy({
         "projects": _projects,
         "builds": _builds,
+        "fleets": _fleets,
     })
 
 
@@ -72,6 +77,7 @@ def load_persisted_state(data):
 def _restore_state(data):
     _projects.update(data.get("projects", {}))
     _builds.update(data.get("builds", {}))
+    _fleets.update(data.get("fleets", {}))
 
     # An executed build lives in a container and a worker thread, neither of
     # which survives a restart, so a restored IN_PROGRESS build would poll as
@@ -95,6 +101,25 @@ def _project_arn(name):
 
 def _build_arn(build_id):
     return f"arn:aws:codebuild:{get_region()}:{get_account_id()}:build/{build_id}"
+
+
+def _fleet_arn(name, fleet_id):
+    """A fleet's ARN carries its name and its id: two fleets created under one
+    name in turn get distinct ARNs, so a project's fleetArn names one fleet."""
+    return f"arn:aws:codebuild:{get_region()}:{get_account_id()}:fleet/{name}:{fleet_id}"
+
+
+def _fleet_by_name(name):
+    for fleet in _fleets.values():
+        if fleet.get("name") == name:
+            return fleet
+    return None
+
+
+def _fleet_from_identifier(value):
+    """The fleet an ARN or a name identifies — BatchGetFleets takes either."""
+    fleet = _fleets.get(value)
+    return fleet if fleet is not None else _fleet_by_name(value)
 
 
 def _project_name_from_identifier(value):
@@ -549,6 +574,11 @@ def _handle_request_sync(method, path, headers, body, query_params):
         "ListBuilds": _list_builds,
         "ListBuildsForProject": _list_builds_for_project,
         "BatchDeleteBuilds": _batch_delete_builds,
+        "CreateFleet": _create_fleet,
+        "BatchGetFleets": _batch_get_fleets,
+        "ListFleets": _list_fleets,
+        "UpdateFleet": _update_fleet,
+        "DeleteFleet": _delete_fleet,
     }
 
     handler = handlers.get(action)
@@ -666,6 +696,106 @@ def _delete_project(data):
                                    f"Project not found: {name}", 400)
     del _projects[name]
     logger.info("DeleteProject: %s", name)
+    return json_response({})
+
+
+# ---------------------------------------------------------------------------
+# Fleet handlers
+#
+# A reserved-capacity fleet is a record only: builds here run in a container
+# or not at all, and a project's environment.fleet.fleetArn is stored as
+# given. The record is what BatchGetFleets and ListFleets read back.
+# ---------------------------------------------------------------------------
+
+# The CreateFleet / UpdateFleet members besides name and tags, stored as given.
+_FLEET_MEMBERS = (
+    "baseCapacity", "environmentType", "computeType", "computeConfiguration",
+    "scalingConfiguration", "overflowBehavior", "vpcConfig",
+    "proxyConfiguration", "imageId", "fleetServiceRole",
+)
+
+
+def _create_fleet(data):
+    name = data.get("name", "")
+    if not name:
+        return error_response_json("InvalidInputException", "Fleet name is required", 400)
+    if _fleet_by_name(name) is not None:
+        return error_response_json("ResourceAlreadyExistsException",
+                                   f"Fleet already exists: {name}", 400)
+    for member in ("baseCapacity", "environmentType", "computeType"):
+        if data.get(member) in (None, ""):
+            return error_response_json("InvalidInputException",
+                                       f"{member} is required", 400)
+
+    now = int(time.time())
+    fleet_id = new_uuid()
+    fleet = {
+        "arn": _fleet_arn(name, fleet_id),
+        "name": name,
+        "id": fleet_id,
+        "created": now,
+        "lastModified": now,
+        "status": {"statusCode": "ACTIVE"},
+        "overflowBehavior": "QUEUE",
+        "tags": data.get("tags", []),
+    }
+    for member in _FLEET_MEMBERS:
+        if data.get(member) not in (None, ""):
+            fleet[member] = data[member]
+    fleet["baseCapacity"] = int(fleet["baseCapacity"])
+    _fleets[fleet["arn"]] = fleet
+    logger.info("CreateFleet: %s", name)
+    return json_response({"fleet": copy.deepcopy(fleet)})
+
+
+def _batch_get_fleets(data):
+    found = []
+    not_found = []
+    for name in data.get("names", []):
+        fleet = _fleet_from_identifier(name)
+        if fleet is not None:
+            found.append(copy.deepcopy(fleet))
+        else:
+            not_found.append(name)
+    return json_response({"fleets": found, "fleetsNotFound": not_found})
+
+
+def _list_fleets(data):
+    sort_by = data.get("sortBy", "NAME")
+    sort_order = data.get("sortOrder", "ASCENDING")
+    fleets = list(_fleets.values())
+    key = {
+        "CREATED_TIME": lambda f: f.get("created", 0),
+        "LAST_MODIFIED_TIME": lambda f: f.get("lastModified", 0),
+    }.get(sort_by, lambda f: f.get("name", ""))
+    fleets.sort(key=key, reverse=(sort_order == "DESCENDING"))
+    return json_response({"fleets": [f["arn"] for f in fleets]})
+
+
+def _update_fleet(data):
+    arn = data.get("arn", "")
+    fleet = _fleets.get(arn)
+    if fleet is None:
+        return error_response_json("ResourceNotFoundException",
+                                   f"Fleet not found: {arn}", 400)
+    for member in _FLEET_MEMBERS:
+        if member in data:
+            fleet[member] = data[member]
+    if "tags" in data:
+        fleet["tags"] = data["tags"]
+    fleet["baseCapacity"] = int(fleet.get("baseCapacity", 1))
+    fleet["lastModified"] = int(time.time())
+    logger.info("UpdateFleet: %s", fleet["name"])
+    return json_response({"fleet": copy.deepcopy(fleet)})
+
+
+def _delete_fleet(data):
+    arn = data.get("arn", "")
+    if arn not in _fleets:
+        return error_response_json("ResourceNotFoundException",
+                                   f"Fleet not found: {arn}", 400)
+    del _fleets[arn]
+    logger.info("DeleteFleet: %s", arn)
     return json_response({})
 
 
