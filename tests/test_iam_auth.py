@@ -3405,6 +3405,102 @@ def test_ssm_parameter_tag_authorization_is_scoped_to_request_account_and_region
 # CreateFunction with an unresolvable role (#1506)
 # ---------------------------------------------------------------------------
 
+class TestKmsAliasAuthorization:
+    """CreateAlias is authorized against the key it names (TargetKeyId) and
+    the alias itself (AliasName), each by ARN, through the real dispatch and
+    evaluator with AUTH on: a role granted kms:CreateAlias on exactly those
+    two ARNs may create the alias, may not create another alias, and a role
+    granted the alias alone is refused. Before the alias ARNs were read the
+    call was evaluated against * and every named grant was refused."""
+
+    _ACCOUNT = "000000000000"
+    _REGION = "us-east-1"
+
+    @staticmethod
+    def _dispatch(access_key, target, payload):
+        import ministack.app as app
+
+        headers = {
+            "host": "localhost:4566",
+            "content-type": "application/x-amz-json-1.1",
+            "x-amz-target": f"TrentService.{target}",
+            "authorization": (
+                f"AWS4-HMAC-SHA256 Credential={access_key}/20260101/us-east-1/kms"
+                "/aws4_request, SignedHeaders=host, Signature=deadbeef"
+            ),
+        }
+        return asyncio.run(app._dispatch_service_request(
+            "POST", "/", headers, json.dumps(payload).encode(), {}, "req-1"))
+
+    def _run(self, monkeypatch, resources, alias_name):
+        """Create a key as root, grant a role kms:CreateAlias on ``resources``
+        (with ``{key}`` standing for the key's ARN), assume it and create
+        ``alias_name`` on the key. Returns (status, body)."""
+        import ministack.app as app
+        from ministack.services import iam as iam_svc
+        from ministack.services import kms as kms_svc
+        from ministack.services import sts as sts_svc
+
+        monkeypatch.setattr(app, "AUTH", True)
+        role_name = "kms-alias-probe"
+        session_key = "ASIAKMSALIASPROBE001"
+        status, _, body = self._dispatch("test", "CreateKey", {})
+        assert status == 200, body
+        key = json.loads(body)["KeyMetadata"]
+        key_arn = key["Arn"]
+        alias_arn = f"arn:aws:kms:{self._REGION}:{self._ACCOUNT}:{alias_name}"
+        iam_svc._roles[role_name] = {
+            "RoleName": role_name,
+            "Arn": f"arn:aws:iam::{self._ACCOUNT}:role/{role_name}",
+            "RoleId": "AROAKMSALIASPROBE", "CreateDate": "2026-01-01", "Path": "/",
+            "AssumeRolePolicyDocument": "{}", "AttachedPolicies": [], "Tags": [],
+            "InlinePolicies": {"aliases": json.dumps({"Statement": [{
+                "Effect": "Allow", "Action": "kms:CreateAlias",
+                "Resource": [r.format(key=key_arn) for r in resources],
+            }]})},
+        }
+        sts_svc.register_session(session_key, {
+            "Arn": f"arn:aws:sts::{self._ACCOUNT}:assumed-role/{role_name}/probe",
+            "UserId": "AROAKMSALIASPROBE:probe",
+            "SecretAccessKey": "s", "SessionToken": "t",
+            "Expiration": time.time() + 3600,
+            "AccountId": self._ACCOUNT, "PrincipalType": "AssumedRole",
+            "SourceAccessKeyId": "test",
+            "SourcePrincipalArn": f"arn:aws:iam::{self._ACCOUNT}:root",
+        })
+        try:
+            status, _, body = self._dispatch(
+                session_key, "CreateAlias", {"AliasName": alias_name, "TargetKeyId": key_arn})
+            created = alias_arn in kms_svc._aliases
+        finally:
+            sts_svc._sessions.pop(session_key, None)
+            iam_svc._roles.pop(role_name, None)
+            kms_svc._aliases.pop(alias_arn, None)
+            kms_svc._alias_dates.pop(alias_arn, None)
+            kms_svc._keys.pop(key["KeyId"], None)
+        return status, body, created
+
+    _KEY_AND_ALIAS = ("{key}", "arn:aws:kms:us-east-1:000000000000:alias/probe")
+
+    def test_a_grant_on_the_key_and_the_alias_allows_the_call(self, monkeypatch):
+        status, body, created = self._run(monkeypatch, self._KEY_AND_ALIAS, "alias/probe")
+        assert status == 200, body
+        assert created
+
+    def test_the_same_grant_refuses_another_alias(self, monkeypatch):
+        status, body, created = self._run(monkeypatch, self._KEY_AND_ALIAS, "alias/other")
+        assert status == 403, body
+        assert b"AccessDeniedException" in body and b"kms:CreateAlias" in body
+        assert not created
+
+    def test_a_grant_on_the_alias_alone_is_refused(self, monkeypatch):
+        status, body, created = self._run(
+            monkeypatch, ("arn:aws:kms:us-east-1:000000000000:alias/probe",), "alias/probe")
+        assert status == 403, body
+        assert b"AccessDeniedException" in body and b"kms:CreateAlias" in body
+        assert not created
+
+
 def test_lambda_create_function_with_a_missing_role_answers_400(monkeypatch):
     """The role check must reach the client, not blow up inside _build_config."""
     import io
