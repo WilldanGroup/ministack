@@ -2160,6 +2160,76 @@ def test_cfn_conditions(cfn, s3):
     with pytest.raises(ClientError):
         s3.head_bucket(Bucket="cfn-t04-cond")
 
+def test_cfn_condition_operand_may_be_any_intrinsic(cfn, ssm):
+    """An Fn::Equals operand built from Fn::Select over Fn::Split of a joined
+    parameter, an Fn::Sub or an Fn::FindInMap resolves to its string before the
+    comparison. Left unresolved, every such condition read true: with one
+    archetype declared, the second slot's resource was created too."""
+    stack_name = "cfn-cond-intrinsic"
+
+    def slot(n):
+        return {"Fn::Not": [{"Fn::Equals": [
+            {"Fn::Select": [n, {"Fn::Split": [",", {"Fn::Join": [
+                ",", [{"Ref": "Archetypes"}, ",,,"]]}]}]},
+            "",
+        ]}]}
+
+    def parameter(condition):
+        return {"Type": "AWS::SSM::Parameter", "Condition": condition,
+                "Properties": {"Name": f"/{stack_name}/{condition}",
+                               "Type": "String", "Value": condition}}
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Parameters": {
+            "Archetypes": {"Type": "String"},
+            "Env": {"Type": "String", "Default": "dev"},
+        },
+        "Mappings": {"Slots": {"dev": {"Count": "1"}, "prod": {"Count": "2"}}},
+        "Conditions": {
+            "Slot0": slot(0),
+            "Slot1": slot(1),
+            "SubMatches": {"Fn::Equals": [{"Fn::Sub": "${Env}-slot"}, "dev-slot"]},
+            "SubMisses": {"Fn::Equals": [{"Fn::Sub": "${Env}-slot"}, "prod-slot"]},
+            "MapSaysOne": {"Fn::Equals": [
+                {"Fn::FindInMap": ["Slots", {"Ref": "Env"}, "Count"]}, "1"]},
+            "MapSaysTwo": {"Fn::Equals": [
+                {"Fn::FindInMap": ["Slots", {"Ref": "Env"}, "Count"]}, "2"]},
+        },
+        "Resources": {
+            condition: parameter(condition)
+            for condition in ("Slot0", "Slot1", "SubMatches", "SubMisses",
+                              "MapSaysOne", "MapSaysTwo")
+        },
+    }
+
+    def created(archetypes):
+        cfn.create_stack(
+            StackName=stack_name, TemplateBody=json.dumps(template),
+            Parameters=[{"ParameterKey": "Archetypes", "ParameterValue": archetypes}],
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        return {r["LogicalResourceId"]
+                for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+
+    assert created("a:v1:local") == {"Slot0", "SubMatches", "MapSaysOne"}
+    for condition in ("Slot0", "SubMatches", "MapSaysOne"):
+        assert ssm.get_parameter(Name=f"/{stack_name}/{condition}")["Parameter"]["Value"] == condition
+    for condition in ("Slot1", "SubMisses", "MapSaysTwo"):
+        with pytest.raises(ClientError) as exc:
+            ssm.get_parameter(Name=f"/{stack_name}/{condition}")
+        assert exc.value.response["Error"]["Code"] == "ParameterNotFound"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+    # Two archetypes fill both slots.
+    assert created("a:v1:local,b:v2:remote") == {"Slot0", "Slot1", "SubMatches", "MapSaysOne"}
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
 def test_cfn_outputs_exports(cfn):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",
