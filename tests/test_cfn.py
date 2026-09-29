@@ -20700,10 +20700,68 @@ def test_cfn_secret_rename_replaces_the_secret(cfn, sm):
         cfn.update_stack(StackName=stack_name, TemplateBody=template(f"cfn-secret-b-{uid}"))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _output(stack, "SecretRef") == f"cfn-secret-b-{uid}"
+        # Ref is the new secret's ARN.
+        assert _output(stack, "SecretRef") == sm.describe_secret(SecretId=f"cfn-secret-b-{uid}")["ARN"]
         assert sm.get_secret_value(SecretId=f"cfn-secret-b-{uid}")["SecretString"] == "same"
         with pytest.raises(ClientError):
             sm.describe_secret(SecretId=f"cfn-secret-a-{uid}")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_secret_ref_is_its_arn(cfn, sm, ssm):
+    """Ref of AWS::SecretsManager::Secret is the secret's ARN
+    (aws-resource-secretsmanager-secret, "Return values"): a parameter
+    carrying the Ref holds the ARN DescribeSecret reports, an update of the
+    secret's Description keeps it, and the stack delete removes the secret it
+    is the physical id of. Before this the Ref was the secret's name."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-secret-ref-{uid}"
+    secret_name = f"cfn-secret-ref-{uid}"
+    parameter_name = f"/cfn-secret-ref-{uid}/secret"
+
+    def template(description):
+        return json.dumps({
+            "Resources": {
+                "TheSecret": {"Type": "AWS::SecretsManager::Secret", "Properties": {
+                    "Name": secret_name, "Description": description, "SecretString": "v1"}},
+                "SecretParam": {"Type": "AWS::SSM::Parameter", "Properties": {
+                    "Name": parameter_name, "Type": "String", "Value": {"Ref": "TheSecret"}}},
+            },
+            "Outputs": {"SecretRef": {"Value": {"Ref": "TheSecret"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("first"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        arn = sm.describe_secret(SecretId=secret_name)["ARN"]
+        assert arn.startswith("arn:aws:secretsmanager:")
+        value = ssm.get_parameter(Name=parameter_name)["Parameter"]["Value"]
+        assert value.startswith("arn:aws:secretsmanager:")
+        assert value == arn
+        assert _output(stack, "SecretRef") == arn
+        resources = {r["LogicalResourceId"]: r["PhysicalResourceId"]
+                     for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+        assert resources["TheSecret"] == arn
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("second"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        described = sm.describe_secret(SecretId=secret_name)
+        assert described["ARN"] == arn
+        assert described["Description"] == "second"
+        assert _output(stack, "SecretRef") == arn
+        assert ssm.get_parameter(Name=parameter_name)["Parameter"]["Value"] == arn
+
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+        with pytest.raises(ClientError) as exc:
+            sm.describe_secret(SecretId=secret_name)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        with pytest.raises(ClientError) as exc:
+            sm.describe_secret(SecretId=arn)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
