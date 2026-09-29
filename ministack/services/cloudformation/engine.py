@@ -633,6 +633,13 @@ def _evaluate_conditions(template: dict, params: dict) -> dict:
                 return _eval(val)
             if "Condition" in val:
                 return _eval(val)
+            # Any other intrinsic a condition may carry — Fn::Select over an
+            # Fn::Split, Fn::Join, Fn::Sub, Fn::FindInMap — resolves against
+            # the parameters and mappings, as it does in AWS. Left as the
+            # dict it was, Fn::Equals compared its text to the operand and
+            # every such condition read true.
+            return _resolve_refs(val, {}, params, evaluated,
+                                 template.get("Mappings", {}), "", "")
         return val
 
     for name, defn in cond_defs.items():
