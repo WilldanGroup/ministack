@@ -1270,6 +1270,12 @@ def evaluate_trust_policy(trust_doc: str | dict,
     return False
 
 
+_ROLE_PRINCIPAL_RE = re.compile(
+    r"^arn:(?P<partition>[^:]+):iam::(?P<account>\d{12}):role/(?:.*/)?(?P<name>[^/]+)$")
+_ASSUMED_ROLE_RE = re.compile(
+    r"^arn:(?P<partition>[^:]+):sts::(?P<account>\d{12}):assumed-role/(?P<name>[^/]+)/[^/]+$")
+
+
 def _principal_matches(principal: Any, caller_arn: str) -> bool:
     """Check if a trust policy Principal matches the caller."""
     if principal == "*":
@@ -1304,6 +1310,17 @@ def _principal_matches(principal: Any, caller_arn: str) -> bool:
             # Also match account root against any principal in that account
             if p.endswith(":root") and f":{p.split(':')[4]}:" in caller_arn:
                 return True
+            # A role ARN as principal admits that role's sessions: the caller
+            # a function or a container presents is the assumed-role ARN
+            # (arn:aws:sts::ACCT:assumed-role/Name/Session), which AWS matches
+            # to the role it was minted from. The role's path is not part of
+            # the session ARN.
+            role = _ROLE_PRINCIPAL_RE.match(p)
+            if role and _ASSUMED_ROLE_RE.match(caller_arn):
+                session = _ASSUMED_ROLE_RE.match(caller_arn)
+                if (role.group("partition"), role.group("account"), role.group("name")) == (
+                        session.group("partition"), session.group("account"), session.group("name")):
+                    return True
         # Service principals — match if the caller ARN looks like it came from
         # that service (e.g., lambda.amazonaws.com allows Lambda-invoked assumes).
         # In local dev, service principals are typically used by MiniStack's own
