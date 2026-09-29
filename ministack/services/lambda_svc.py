@@ -1234,6 +1234,21 @@ def _rewrite_host_for_container(url: str) -> str:
     return url
 
 
+def _rewrite_urls_for_container(value):
+    """``_rewrite_host_for_container`` applied to every URL in an event: a
+    string that is a ``http://`` or ``https://`` address, at any depth of the
+    event's dicts and lists. Anything else is returned as it was."""
+    if isinstance(value, str):
+        if value.startswith(("http://", "https://")):
+            return _rewrite_host_for_container(value)
+        return value
+    if isinstance(value, dict):
+        return {k: _rewrite_urls_for_container(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_rewrite_urls_for_container(v) for v in value]
+    return value
+
+
 def _fetch_code_from_s3(bucket: str, key: str, version_id: str | None = None) -> bytes | None:
     """Fetch Lambda code zip from the in-memory S3 service.
 
@@ -3959,13 +3974,15 @@ def _rie_terminal_result(exc: BaseException, timeout: int, logs: str) -> dict:
 def _invoke_rie(container, event: dict, timeout: int) -> dict:
     """POST event to a running RIE container's HTTP endpoint."""
     import urllib.request
-    # A CloudFormation custom-resource ResponseURL points at ministack on the
-    # host; rewrite localhost/127.0.0.1 to host.docker.internal so the callback
-    # is reachable from inside the container (issue #1149), consistent with the
-    # AWS_ENDPOINT_URL rewrite. Without this the PUT fails with ConnectionRefused
-    # and the stack hangs on the custom resource until ServiceTimeout.
-    if isinstance(event, dict) and event.get("ResponseURL"):
-        event = {**event, "ResponseURL": _rewrite_host_for_container(event["ResponseURL"])}
+    # A URL ministack minted points at itself on the host — a custom
+    # resource's ResponseURL, a WaitConditionHandle's signal URL handed down
+    # as a resource property or a state machine's input, a presigned S3 URL —
+    # so every localhost/127.0.0.1 URL in the event is rewritten to
+    # host.docker.internal, where the container reaches the host (issue
+    # #1149), consistent with the AWS_ENDPOINT_URL rewrite. Without this the
+    # PUT fails with ConnectionRefused and the stack hangs on the custom
+    # resource, or on the wait condition, until its timeout.
+    event = _rewrite_urls_for_container(event)
     max_attempts = int(timeout * 10) + 20
     connect_deadline = time.time() + min(timeout + 2.0, _RIE_CONNECT_RETRY_SECONDS)
     for _attempt in range(max_attempts):
