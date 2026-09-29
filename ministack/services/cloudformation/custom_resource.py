@@ -14,6 +14,9 @@ _HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _PORT = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
 
 _lock = threading.Lock()
+# How long an errored invocation's response is still awaited before the
+# resource fails with the invocation's error.
+_INVOKE_ERROR_GRACE = 2.0
 # token → {"event": threading.Event, "result": dict | None}
 _pending: dict = {}
 
@@ -133,11 +136,32 @@ def invoke_custom_resource(
 
     event_obj = register_token(token)
 
+    invoke_error = None
     try:
         exec_record = _lambda_svc._execution_record_for_config(func_record, func_config)
-        _lambda_svc._execute_function_with_config_scope(exec_record, cfn_event)
+        result = _lambda_svc._execute_function_with_config_scope(exec_record, cfn_event)
+        if isinstance(result, dict) and result.get("error"):
+            body = result.get("body") or {}
+            invoke_error = (
+                f"{body.get('errorType', 'Error')}: {body.get('errorMessage', '')}"
+                if isinstance(body, dict) else str(body)
+            )
     except Exception as exc:
         logger.warning("Custom resource Lambda raised synchronously: %s", exc)
+        invoke_error = f"{type(exc).__name__}: {exc}"
+
+    if invoke_error is not None:
+        # The function errored before it could answer — its container never
+        # started, or the handler raised. No response is coming, so the
+        # resource fails now with that error as the reason rather than after
+        # ServiceTimeout. A handler that responded and then raised has its
+        # response taken: the grace period is for that PUT to land.
+        if not event_obj.wait(timeout=_INVOKE_ERROR_GRACE):
+            with _lock:
+                _pending.pop(token, None)
+            raise RuntimeError(
+                f"Custom resource {logical_id!r} invocation failed: {invoke_error}"
+            )
 
     signalled = event_obj.wait(timeout=service_timeout)
 
