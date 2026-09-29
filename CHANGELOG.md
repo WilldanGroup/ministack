@@ -52,6 +52,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 - **SSM — parameter tag actions authorize the parameter named by `ResourceId`** — with `AUTH=true`, `AddTagsToResource`, `RemoveTagsFromResource`, and `ListTagsForResource` checked `Name` instead, so an exact ARN allow could fail and an exact ARN deny could be missed under a broad allow. Accepted parameter-name and ARN aliases now use the canonical parameter ARN for the IAM check. Tag authorization denials now match AWS's HTTP 400 JSON 1.1 response, including the canonical resource and explicit-deny reason.
 
+### Added
+
+- **CloudFormation — `AWS::Events::Archive`, `AWS::Events::EventBusPolicy`, `AWS::Route53::RecordSetGroup`, `AWS::IAM::OIDCProvider`, `AWS::CodeBuild::Fleet`, `AWS::AppSync::DomainName` and `AWS::AppSync::DomainNameApiAssociation`** — a nested-stack deploy declaring them answered `Unrecognized resource types`. Each provisions through its service, so `DescribeArchive`, `DescribeEventBus`, `ListResourceRecordSets`, `GetOpenIDConnectProvider`, `BatchGetFleets` and `GetDomainName` read the stack's resources back; updates keep the resource in place and replace it only on a create-only property (`ArchiveName`, `SourceArn`, `StatementId`, `EventBusName`, the hosted zone, `Url`, `Name`, `DomainName`).
+- **CodeBuild — fleets** — `CreateFleet`, `BatchGetFleets`, `ListFleets`, `UpdateFleet` and `DeleteFleet`, as records: a project's `environment.fleet.fleetArn` is stored as given.
+- **AppSync — custom domain names** — `CreateDomainName`, `GetDomainName`, `ListDomainNames`, `UpdateDomainName`, `DeleteDomainName`, `AssociateApi`, `GetApiAssociation` and `DisassociateApi`, with a CloudFront-shaped `appsyncDomainName` and CloudFront's hosted zone id for a Route 53 alias.
+- **EventBridge — `PutPermission` takes `Policy`** — the whole-policy form replaces the bus's resource policy, as on AWS.
+
 ## [1.5.19] — 2026-09-30
 
 ### Added

@@ -680,6 +680,11 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "InstanceProfileName",
         "requires_replacement": lambda old, new: old.get("Path", "/") != new.get("Path", "/"),
     },
+    # SourceArn is "Update requires: Replacement" in the resource reference.
+    "AWS::Events::Archive": {
+        "name": "ArchiveName",
+        "requires_replacement": lambda old, new: old.get("SourceArn") != new.get("SourceArn"),
+    },
     "AWS::IoT::ProvisioningTemplate": {
         "name": "TemplateName",
         "requires_replacement": lambda old, new: (
@@ -966,6 +971,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::AppConfig::DeploymentStrategy": ("Tags", "list"),
     "AWS::AppConfig::Environment": ("Tags", "list"),
     "AWS::AppSync::GraphQLApi": ("Tags", "list"),
+    "AWS::AppSync::DomainName": ("Tags", "list"),
     "AWS::AutoScaling::AutoScalingGroup": ("Tags", "list"),
     "AWS::Backup::BackupPlan": ("BackupPlanTags", "map"),
     "AWS::Backup::BackupVault": ("BackupVaultTags", "map"),
@@ -974,6 +980,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::CloudFront::Distribution": ("Tags", "list"),
     "AWS::CloudWatch::Alarm": ("Tags", "list"),
     "AWS::CodeBuild::Project": ("Tags", "list"),
+    "AWS::CodeBuild::Fleet": ("Tags", "list"),
     "AWS::Cognito::IdentityPool": ("IdentityPoolTags", "map"),
     "AWS::Cognito::UserPool": ("UserPoolTags", "map"),
     "AWS::DynamoDB::Table": ("Tags", "list"),
@@ -993,6 +1000,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::ElasticLoadBalancingV2::TargetGroup": ("Tags", "list"),
     "AWS::Events::EventBus": ("Tags", "list"),
     "AWS::IAM::Role": ("Tags", "list"),
+    "AWS::IAM::OIDCProvider": ("Tags", "list"),
     "AWS::KMS::Key": ("Tags", "list"),
     "AWS::Kinesis::Stream": ("Tags", "list"),
     "AWS::Lambda::Function": ("Tags", "list"),
@@ -2320,6 +2328,64 @@ def _iam_role_delete(physical_id, props):
             _iam.detach_managed_policy(role, policy_arn)
 
 
+# --- IAM OIDCProvider ---
+#
+# The provider record is the one GetOpenIDConnectProvider reads, kept the way
+# CreateOpenIDConnectProvider keeps it. Its ARN is derived from the Url, so
+# the Url is both the physical id and the one create-only property.
+
+def _iam_oidc_provider_arn(url):
+    # The service's own derivation (_create_oidc_provider): the ARN carries
+    # the URL without its scheme.
+    host = str(url).replace("https://", "").replace("http://", "").rstrip("/")
+    return f"arn:aws:iam::{get_account_id()}:oidc-provider/{host}"
+
+
+def _iam_oidc_provider_create(logical_id, props, stack_name):
+    url = props.get("Url")
+    if not url:
+        raise ValueError("Property Url is required for AWS::IAM::OIDCProvider")
+    arn = _iam_oidc_provider_arn(url)
+    if arn in _iam._oidc_providers:
+        raise ValueError(f"OIDC provider with url {url} already exists.")
+    _iam._oidc_providers[arn] = {
+        "Url": url,
+        "ClientIDList": [str(c) for c in props.get("ClientIdList") or []],
+        "ThumbprintList": [str(t) for t in props.get("ThumbprintList") or []],
+        "Arn": arn,
+        "CreateDate": _iam._now(),
+        "Tags": [{"Key": t.get("Key", ""), "Value": t.get("Value", "")}
+                 for t in props.get("Tags") or []],
+    }
+    return arn, {"Arn": arn}
+
+
+def _iam_oidc_provider_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Url is the one create-only property (aws-resource-iam-oidcprovider):
+    it is the ARN, so a change replaces, the new provider created before the
+    old one goes. ClientIdList, ThumbprintList and Tags update in place, as
+    AddClientIDToOpenIDConnectProvider, UpdateOpenIDConnectProviderThumbprint
+    and TagOpenIDConnectProvider would; a tag added outside the stack stays.
+    """
+    arn = _iam_oidc_provider_arn(new_props.get("Url", ""))
+    provider = _iam._oidc_providers.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        arn, physical_id if provider is not None else None,
+        _iam_oidc_provider_create, _iam_oidc_provider_delete,
+    )
+    if replaced is not None:
+        return replaced
+    provider["ClientIDList"] = [str(c) for c in new_props.get("ClientIdList") or []]
+    provider["ThumbprintList"] = [str(t) for t in new_props.get("ThumbprintList") or []]
+    _reconcile_tag_list(provider.setdefault("Tags", []), old_props, new_props)
+    return physical_id, {"Arn": physical_id}
+
+
+def _iam_oidc_provider_delete(physical_id, props):
+    _iam._oidc_providers.pop(physical_id, None)
+
+
 # --- IAM Policy ---
 #
 # AWS::IAM::ManagedPolicy creates a managed policy and attaches it;
@@ -3502,6 +3568,143 @@ def _eb_event_bus_delete(physical_id, props):
 
 
 # --- Kinesis Stream ---
+
+
+# --- EventBridge Archive ---
+
+def _eb_archive_pattern(props):
+    pattern = props.get("EventPattern", "")
+    return json.dumps(pattern) if isinstance(pattern, dict) else (pattern or "")
+
+
+def _eb_archive_create(logical_id, props, stack_name):
+    # CreateArchive's 48-character name limit.
+    name = props.get("ArchiveName") or _physical_name(stack_name, logical_id, max_len=48)
+    resp = _eb._create_archive({
+        "ArchiveName": name,
+        "EventSourceArn": props.get("SourceArn", ""),
+        "Description": props.get("Description", ""),
+        "EventPattern": _eb_archive_pattern(props),
+        "RetentionDays": int(props.get("RetentionDays") or 0),
+    })
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Events::Archive CreateArchive failed: {resp[2]!r}")
+    return name, {"Arn": _eb._archives[name]["ArchiveArn"]}
+
+
+def _eb_archive_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update through UpdateArchive, so the archive keeps its ARN and the
+    events it holds. ArchiveName and SourceArn are create-only
+    (aws-resource-events-archive): a rename replaces through the shared
+    prologue; a source change under a generated name takes the name back,
+    the old archive removed first because the service refuses a second one
+    under the same name, and under an explicit name is refused above the
+    handler through _CUSTOM_NAME_REPLACEMENT.
+    """
+    name = new_props.get("ArchiveName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=48
+    )
+    archive = _eb._archives.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, archive.get("ArchiveName") if archive else None,
+        _eb_archive_create, _eb_archive_delete,
+    )
+    if replaced is not None:
+        return replaced
+    if new_props.get("SourceArn", "") != old_props.get("SourceArn", ""):
+        _eb_archive_delete(physical_id, old_props)
+        return _eb_archive_create(logical_id or physical_id, new_props, stack_name)
+    resp = _eb._update_archive({
+        "ArchiveName": name,
+        "Description": new_props.get("Description", ""),
+        "EventPattern": _eb_archive_pattern(new_props),
+        "RetentionDays": int(new_props.get("RetentionDays") or 0),
+    })
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Events::Archive UpdateArchive failed: {resp[2]!r}")
+    return name, {"Arn": archive["ArchiveArn"]}
+
+
+def _eb_archive_delete(physical_id, props):
+    if physical_id in _eb._archives:
+        _eb._delete_archive({"ArchiveName": physical_id})
+
+
+# --- EventBridge EventBusPolicy ---
+#
+# One statement of a bus's resource policy, kept where PutPermission keeps it
+# so DescribeEventBus reads the stack's grant back. The template carries
+# either the whole Statement or the legacy Action / Principal / Condition
+# trio PutPermission takes. The physical id is the StatementId, which is the
+# statement's Sid; the bus is not in it, so a bus move replaces under an
+# unchanged id.
+
+def _eb_bus_policy_put(bus, statement_id, props):
+    _eb._ensure_default_bus()
+    if bus not in _eb._event_buses:
+        raise ValueError(f"Event bus {bus} does not exist.")
+    declared = props.get("Statement")
+    if isinstance(declared, dict) and declared:
+        statement = copy.deepcopy(declared)
+        statement["Sid"] = statement_id
+        statement.setdefault("Effect", "Allow")
+        _eb._bus_policy_statement_put(bus, statement)
+        return
+    data = {
+        "EventBusName": bus,
+        "StatementId": statement_id,
+        "Action": props.get("Action", "events:PutEvents"),
+        "Principal": props.get("Principal", "*"),
+    }
+    if props.get("Condition"):
+        data["Condition"] = props["Condition"]
+    resp = _eb._put_permission(data)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Events::EventBusPolicy PutPermission failed: {resp[2]!r}")
+
+
+def _eb_bus_policy_present(bus, statement_id):
+    policy = _eb._event_bus_policies.get(bus) or {}
+    return any(s.get("Sid") == statement_id for s in policy.get("Statement", []))
+
+
+def _eb_bus_policy_create(logical_id, props, stack_name):
+    statement_id = props.get("StatementId") or _physical_name(stack_name, logical_id, max_len=64)
+    _eb_bus_policy_put(props.get("EventBusName", "default"), statement_id, props)
+    return statement_id, {}
+
+
+def _eb_bus_policy_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Re-put the statement under its Sid, so the rest of the bus policy —
+    statements other stacks or PutPermission added — stays. EventBusName and
+    StatementId are both create-only (aws-resource-events-eventbuspolicy): a
+    change of either puts the statement on its new bus or under its new Sid
+    first and then removes the old one, deleting it itself when the id did
+    not change because the id does not carry the bus.
+    """
+    statement_id = new_props.get("StatementId") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=64
+    )
+    old_bus = old_props.get("EventBusName", "default")
+    new_bus = new_props.get("EventBusName", "default")
+    current = (physical_id, old_bus) if _eb_bus_policy_present(old_bus, physical_id) else None
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        (statement_id, new_bus), current, _eb_bus_policy_create, _eb_bus_policy_delete,
+        delete_when_id_unchanged=True,
+    )
+    if replaced is not None:
+        return replaced
+    _eb_bus_policy_put(new_bus, statement_id, new_props)
+    return statement_id, {}
+
+
+def _eb_bus_policy_delete(physical_id, props):
+    _eb._remove_permission({
+        "EventBusName": props.get("EventBusName", "default"),
+        "StatementId": physical_id,
+    })
 
 def _kinesis_stream_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, lowercase=True, max_len=128)
@@ -5756,6 +5959,121 @@ def _appsync_api_delete(physical_id, props):
     _appsync._delete_graphql_api(physical_id)
 
 
+# --- AppSync DomainName and DomainNameApiAssociation ---
+#
+# Both go through the service's own functions, so GetDomainName and
+# GetApiAssociation read the stack's records back. The domain name is the
+# physical id of both resources: the association is one per domain.
+
+def _appsync_domain_name_attrs(record):
+    return {
+        "AppSyncDomainName": record["appsyncDomainName"],
+        "DomainName": record["domainName"],
+        "HostedZoneId": record["hostedZoneId"],
+        "Arn": record["domainNameArn"],
+    }
+
+
+def _appsync_domain_name_create(logical_id, props, stack_name):
+    domain = props.get("DomainName")
+    if not domain:
+        raise ValueError("Property DomainName is required for AWS::AppSync::DomainName")
+    if domain in _appsync._domain_names:
+        raise ValueError(f"AppSync domain name already exists: {domain}")
+    resp = _appsync._create_domain_name({
+        "domainName": domain,
+        "certificateArn": props.get("CertificateArn", ""),
+        "description": props.get("Description", ""),
+        "tags": _tag_map(_appsync_api_tags(props)["Tags"]),
+    })
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::AppSync::DomainName CreateDomainName failed: {resp[2]!r}")
+    return domain, _appsync_domain_name_attrs(_appsync._domain_names[domain])
+
+
+def _appsync_domain_name_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """DomainName is create-only (aws-resource-appsync-domainname): a change
+    replaces, the new domain created before the old one goes. Description
+    updates through UpdateDomainName; CertificateArn and Tags in place on the
+    record, the tags reconciled against the template's own.
+    """
+    domain = new_props.get("DomainName", "")
+    record = _appsync._domain_names.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        domain, physical_id if record is not None else None,
+        _appsync_domain_name_create, _appsync_domain_name_delete,
+    )
+    if replaced is not None:
+        return replaced
+    resp = _appsync._update_domain_name(
+        physical_id, {"description": new_props.get("Description", "")}
+    )
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::AppSync::DomainName UpdateDomainName failed: {resp[2]!r}")
+    record["certificateArn"] = new_props.get("CertificateArn", "")
+    tags = _appsync._tags.setdefault(record["domainNameArn"], {})
+    _reconcile_tag_map(tags, _appsync_api_tags(old_props), _appsync_api_tags(new_props))
+    if not tags:
+        _appsync._tags.pop(record["domainNameArn"], None)
+    return physical_id, _appsync_domain_name_attrs(record)
+
+
+def _appsync_domain_name_delete(physical_id, props):
+    # An association the stack delete has not reached yet goes with the
+    # domain: DeleteDomainName refuses an associated domain, and nothing can
+    # answer on a name that is gone.
+    _appsync._api_associations.pop(physical_id, None)
+    _appsync._delete_domain_name(physical_id)
+
+
+def _appsync_domain_association_attrs(domain):
+    return {"ApiAssociationIdentifier": domain, "DomainName": domain}
+
+
+def _appsync_domain_association_create(logical_id, props, stack_name):
+    domain = props.get("DomainName")
+    api_id = props.get("ApiId")
+    if not domain or not api_id:
+        raise ValueError(
+            "Properties DomainName and ApiId are required for "
+            "AWS::AppSync::DomainNameApiAssociation"
+        )
+    existing = _appsync._api_associations.get(domain)
+    if existing is not None and existing.get("apiId") != api_id:
+        raise ValueError(
+            f"AppSync domain name {domain} is already associated with API {existing['apiId']}"
+        )
+    resp = _appsync._associate_api(domain, {"apiId": api_id})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::AppSync::DomainNameApiAssociation AssociateApi failed: {resp[2]!r}")
+    return domain, _appsync_domain_association_attrs(domain)
+
+
+def _appsync_domain_association_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """DomainName is create-only (aws-resource-appsync-domainnameapiassociation):
+    a change associates the new domain before the old one is disassociated.
+    ApiId updates in place: the domain is re-associated with the new API.
+    """
+    domain = new_props.get("DomainName", "")
+    current = physical_id if physical_id in _appsync._api_associations else None
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        domain, current, _appsync_domain_association_create,
+        _appsync_domain_association_delete,
+    )
+    if replaced is not None:
+        return replaced
+    resp = _appsync._associate_api(physical_id, {"apiId": new_props.get("ApiId", "")})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::AppSync::DomainNameApiAssociation AssociateApi failed: {resp[2]!r}")
+    return physical_id, _appsync_domain_association_attrs(physical_id)
+
+
+def _appsync_domain_association_delete(physical_id, props):
+    _appsync._disassociate_api(physical_id)
+
+
 def _appsync_ds_create(logical_id, props, stack_name):
     api_id = props.get("ApiId", "")
     name = props.get("Name") or logical_id
@@ -6685,6 +7003,85 @@ def _codebuild_project_create(logical_id, props, stack_name):
 
 def _codebuild_project_delete(physical_id, props):
     _codebuild._projects.pop(physical_id, None)
+
+
+# --- CodeBuild Fleet provisioner ---
+#
+# Through CreateFleet / UpdateFleet, so BatchGetFleets and ListFleets read the
+# stack's fleet back. The physical id is the fleet ARN, which carries the id
+# CreateFleet assigned, as on AWS (Ref returns the ARN).
+
+_CODEBUILD_FLEET_MEMBERS = (
+    ("ComputeConfiguration", "computeConfiguration"),
+    ("ScalingConfiguration", "scalingConfiguration"),
+    ("FleetVpcConfig", "vpcConfig"),
+    ("FleetProxyConfiguration", "proxyConfiguration"),
+    ("ImageId", "imageId"),
+    ("FleetServiceRole", "fleetServiceRole"),
+)
+
+
+def _codebuild_fleet_members(props):
+    """The template's properties as CreateFleet / UpdateFleet members."""
+    members = {
+        "baseCapacity": int(props.get("BaseCapacity", 1)),
+        "environmentType": props.get("EnvironmentType", "LINUX_CONTAINER"),
+        "computeType": props.get("ComputeType", "BUILD_GENERAL1_SMALL"),
+        "overflowBehavior": props.get("OverflowBehavior", "QUEUE"),
+        "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
+    }
+    for prop, member in _CODEBUILD_FLEET_MEMBERS:
+        value = props.get(prop)
+        if value not in (None, "", {}, []):
+            members[member] = _pascal_to_camel(value) if isinstance(value, (dict, list)) else value
+    return members
+
+
+def _codebuild_fleet_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
+    if _codebuild._fleet_by_name(name) is not None:
+        raise ValueError(f"CodeBuild fleet already exists: {name}")
+    resp = _codebuild._create_fleet({"name": name, **_codebuild_fleet_members(props)})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::CodeBuild::Fleet CreateFleet failed: {resp[2]!r}")
+    fleet = _codebuild._fleet_by_name(name)
+    return fleet["arn"], {"Arn": fleet["arn"], "Id": fleet["id"]}
+
+
+def _codebuild_fleet_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update through UpdateFleet, keeping the ARN (which carries the fleet's
+    id) so the projects pointing at it stay valid. Name is the one create-only
+    property (aws-resource-codebuild-fleet): a rename replaces, the new fleet
+    created before the old one goes. A member the template dropped is removed
+    from the fleet; Tags are reconciled against the template's own, so one
+    added outside the stack survives.
+    """
+    name = new_props.get("Name") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=128
+    )
+    fleet = _codebuild._fleets.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, fleet.get("name") if fleet else None,
+        _codebuild_fleet_create, _codebuild_fleet_delete,
+    )
+    if replaced is not None:
+        return replaced
+    members = _codebuild_fleet_members(new_props)
+    members.pop("tags")
+    resp = _codebuild._update_fleet({"arn": physical_id, **members})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::CodeBuild::Fleet UpdateFleet failed: {resp[2]!r}")
+    for _prop, member in _CODEBUILD_FLEET_MEMBERS:
+        if member not in members:
+            fleet.pop(member, None)
+    _reconcile_tag_list(fleet.setdefault("tags", []), old_props, new_props,
+                        key="key", value="value")
+    return physical_id, {"Arn": physical_id, "Id": fleet["id"]}
+
+
+def _codebuild_fleet_delete(physical_id, props):
+    _codebuild._fleets.pop(physical_id, None)
 
 
 # --- IAM ManagedPolicy provisioner ---
@@ -9101,6 +9498,96 @@ def _r53_record_set_delete(physical_id, props):
         _r53._records[zone_id] = [
             r for r in _r53._records[zone_id] if _r53._rs_key(r) != key
         ]
+
+
+# --- Route53 RecordSetGroup ---
+#
+# The group's records are kept one by one in the zone, exactly as
+# AWS::Route53::RecordSet keeps its single record, so ListResourceRecordSets
+# reads them back and the two types share every builder. The group itself
+# has no service record: the physical id is a generated name, and the
+# template's RecordSets list is what the delete and the update reconcile
+# against. Every write is one batch under the zone lock, as a change batch
+# is on Route 53.
+
+def _r53_record_set_group_records(props):
+    """The zone and the built record sets the template declares. A record
+    declared twice in one group is refused, as Route 53 refuses it in one
+    change batch."""
+    zone_id = _r53_resolve_hosted_zone_id(props)
+    records, seen = [], set()
+    for entry in props.get("RecordSets") or []:
+        rs = _r53_record_set_build_rs(entry)
+        key = _r53._rs_key(rs)
+        if key in seen:
+            raise ValueError(
+                f"Route 53 record declared twice in one RecordSetGroup: {rs['Name']} "
+                f"type {rs['Type']} set={rs.get('SetIdentifier', '')!r}"
+            )
+        seen.add(key)
+        records.append(rs)
+    return zone_id, records
+
+
+def _r53_record_set_group_write(zone_id, add, remove_keys):
+    """Under the zone lock: drop the records whose identity is in
+    ``remove_keys``, then add ``add``, refusing one whose identity a record
+    the group does not own already holds."""
+    with _r53._lock:
+        if zone_id not in _r53._zones:
+            raise ValueError(f"No hosted zone with id '{zone_id}'")
+        current = [r for r in _r53._records.get(zone_id, [])
+                   if _r53._rs_key(r) not in remove_keys]
+        taken = {_r53._rs_key(r) for r in current}
+        for rs in add:
+            if _r53._rs_key(rs) in taken:
+                raise ValueError(
+                    f"Route 53 record already exists: {rs['Name']} type {rs['Type']} "
+                    f"set={rs.get('SetIdentifier', '')!r}"
+                )
+        _r53._records[zone_id] = current + add
+
+
+def _r53_record_set_group_create(logical_id, props, stack_name):
+    zone_id, records = _r53_record_set_group_records(props)
+    _r53_record_set_group_write(zone_id, records, set())
+    return _physical_name(stack_name, logical_id), {}
+
+
+def _r53_record_set_group_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Reconcile the zone against the template's list: records dropped from
+    it are deleted, added ones created, changed ones replaced, in one write
+    under the zone lock. HostedZoneId and HostedZoneName are create-only
+    (aws-resource-route53-recordsetgroup): a zone change creates the records
+    in the new zone and then removes them from the old one, under the same
+    generated physical id.
+    """
+    zone_id, records = _r53_record_set_group_records(new_props)
+    try:
+        old_zone_id, old_records = _r53_record_set_group_records(old_props)
+    except ValueError:
+        old_zone_id, old_records = None, []
+    if old_zone_id != zone_id:
+        _r53_record_set_group_write(zone_id, records, set())
+        if old_zone_id is not None:
+            _delete_predecessor(_r53_record_set_group_delete, physical_id, old_props)
+        return physical_id, {}
+    _r53_record_set_group_write(zone_id, records, {_r53._rs_key(r) for r in old_records})
+    return physical_id, {}
+
+
+def _r53_record_set_group_delete(physical_id, props):
+    try:
+        zone_id, records = _r53_record_set_group_records(props)
+    except ValueError:
+        # The zone is gone already, and its records with it.
+        return
+    keys = {_r53._rs_key(r) for r in records}
+    with _r53._lock:
+        if zone_id in _r53._records:
+            _r53._records[zone_id] = [
+                r for r in _r53._records[zone_id] if _r53._rs_key(r) not in keys
+            ]
 
 
 # ---------------------------------------------------------------------------
@@ -11922,6 +12409,13 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::WAFv2::WebACL": ("Name", "Scope"),
     "AWS::CertificateManager::Certificate": _ACM_REPLACEMENT_PROPERTIES,
     "AWS::CloudFront::Function": ("Name",),
+    "AWS::Events::Archive": ("ArchiveName", "SourceArn"),
+    "AWS::Events::EventBusPolicy": ("EventBusName", "StatementId"),
+    "AWS::Route53::RecordSetGroup": ("HostedZoneId", "HostedZoneName"),
+    "AWS::IAM::OIDCProvider": ("Url",),
+    "AWS::CodeBuild::Fleet": ("Name",),
+    "AWS::AppSync::DomainName": ("DomainName",),
+    "AWS::AppSync::DomainNameApiAssociation": ("DomainName",),
     "AWS::SSM::Parameter": ("Name",),
     "AWS::SQS::Queue": ("QueueName", "FifoQueue"),
     "AWS::SNS::Topic": ("TopicName", "FifoTopic"),
@@ -12077,6 +12571,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _iam_role_delete,
     },
+    "AWS::IAM::OIDCProvider": {
+        "create": _iam_oidc_provider_create,
+        "update": _iam_oidc_provider_update,
+        "update_with_logical_id": True,
+        "delete": _iam_oidc_provider_delete,
+    },
     "AWS::IAM::Policy": {
         "create": _iam_policy_create,
         "update": _iam_policy_update,
@@ -12147,6 +12647,18 @@ _RESOURCE_HANDLERS = {
         "update": _eb_rule_update,
         "update_with_logical_id": True,
         "delete": _eb_rule_delete,
+    },
+    "AWS::Events::Archive": {
+        "create": _eb_archive_create,
+        "update": _eb_archive_update,
+        "update_with_logical_id": True,
+        "delete": _eb_archive_delete,
+    },
+    "AWS::Events::EventBusPolicy": {
+        "create": _eb_bus_policy_create,
+        "update": _eb_bus_policy_update,
+        "update_with_logical_id": True,
+        "delete": _eb_bus_policy_delete,
     },
     "AWS::KinesisFirehose::DeliveryStream": {
         "create": _firehose_delivery_stream_create,
@@ -12294,6 +12806,18 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _appsync_api_delete,
     },
+    "AWS::AppSync::DomainName": {
+        "create": _appsync_domain_name_create,
+        "update": _appsync_domain_name_update,
+        "update_with_logical_id": True,
+        "delete": _appsync_domain_name_delete,
+    },
+    "AWS::AppSync::DomainNameApiAssociation": {
+        "create": _appsync_domain_association_create,
+        "update": _appsync_domain_association_update,
+        "update_with_logical_id": True,
+        "delete": _appsync_domain_association_delete,
+    },
     "AWS::AppSync::DataSource": {"create": _appsync_ds_create, "delete": _appsync_ds_delete},
     "AWS::AppSync::FunctionConfiguration": {
         "create": _appsync_function_create,
@@ -12365,6 +12889,12 @@ _RESOURCE_HANDLERS = {
         "delete": _elbv2_listener_rule_delete,
     },
     "AWS::CodeBuild::Project": {"create": _codebuild_project_create, "update": _codebuild_project_update, "delete": _codebuild_project_delete},
+    "AWS::CodeBuild::Fleet": {
+        "create": _codebuild_fleet_create,
+        "update": _codebuild_fleet_update,
+        "update_with_logical_id": True,
+        "delete": _codebuild_fleet_delete,
+    },
     "AWS::IAM::ManagedPolicy": {
         "create": _iam_managed_policy_create,
         "update": _iam_managed_policy_update,
@@ -12502,6 +13032,12 @@ _RESOURCE_HANDLERS = {
         "update": _sd_instance_update,
         "update_with_logical_id": True,
         "delete": _sd_instance_delete,
+    },
+    "AWS::Route53::RecordSetGroup": {
+        "create": _r53_record_set_group_create,
+        "update": _r53_record_set_group_update,
+        "update_with_logical_id": True,
+        "delete": _r53_record_set_group_delete,
     },
     "AWS::ApiGatewayV2::Api": {
         "create": _apigw_v2_api_create,
