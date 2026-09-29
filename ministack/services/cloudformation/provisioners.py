@@ -4200,17 +4200,20 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
             continue
         resource_type = res_def.get("Type", "AWS::CloudFormation::CustomResource")
         raw_props = res_def.get("Properties", {})
-        resolved_props = _resolve_refs(
-            copy.deepcopy(raw_props), provisioned, param_values,
-            conditions, mappings, child_name, child_stack_id,
-        )
-        if isinstance(resolved_props, dict):
-            resolved_props = {k: v for k, v in resolved_props.items()
-                              if v is not _NO_VALUE_SENTINEL()}
-
         _add_event(child_stack_id, child_name, child_logical_id, resource_type,
                    f"{status_prefix}_IN_PROGRESS")
         try:
+            # Inside the try: a property that does not resolve (a GetAtt of an
+            # attribute the resource lacks) fails this resource with an event
+            # and a status, as any other failure does, rather than leaving the
+            # child IN_PROGRESS with nothing recorded.
+            resolved_props = _resolve_refs(
+                copy.deepcopy(raw_props), provisioned, param_values,
+                conditions, mappings, child_name, child_stack_id,
+            )
+            if isinstance(resolved_props, dict):
+                resolved_props = {k: v for k, v in resolved_props.items()
+                                  if v is not _NO_VALUE_SENTINEL()}
             prev = prev_resources.get(child_logical_id)
             new_tagged = _with_stack_tags(
                 resource_type, resolved_props, child_stack["Tags"],
@@ -4231,9 +4234,13 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                 # delete the predecessor at once, not into the parent's queue.
                 deferred_token = _DEFERRED_PREDECESSOR_DELETES.set(None)
                 try:
+                    # The attributes the resource answered last time travel
+                    # with it: an unchanged resource is not re-provisioned,
+                    # and what reads it through GetAtt still resolves.
                     physical_id, attrs = _update_resource(
                         resource_type, prev.get("PhysicalResourceId", child_logical_id),
                         old_tagged, new_tagged, child_name, child_logical_id,
+                        prev.get("Attributes", {}),
                     )
                 finally:
                     _DEFERRED_PREDECESSOR_DELETES.reset(deferred_token)
