@@ -17128,6 +17128,44 @@ def test_custom_resource_timeout_fails_stack(cfn, lam):
         lam.delete_function(FunctionName="cr-test-timeout")
 
 
+# -- Invocation error (the handler raises before it can respond) ------------
+
+_CR_HANDLER_RAISES = """\
+def handler(event, context):
+    raise RuntimeError("the provider blew up before responding")
+"""
+
+
+def test_custom_resource_invoke_error_fails_stack_now(cfn, lam):
+    """A handler that errors before PUTting to ResponseURL fails the resource
+    with that error as the reason, not after ServiceTimeout."""
+    lam.create_function(
+        FunctionName="cr-test-raises",
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_RAISES)},
+    )
+    tpl = _cfn_custom_template("cr-test-raises", extra_props={"ServiceTimeout": "3600"})
+    try:
+        started = time.time()
+        cfn.create_stack(StackName="cr-t11", TemplateBody=tpl)
+        stack = _wait_stack(cfn, "cr-t11", timeout=60)
+        assert stack["StackStatus"] in ("ROLLBACK_COMPLETE", "CREATE_FAILED"), stack
+        assert time.time() - started < 60
+        events = cfn.describe_stack_events(StackName="cr-t11")["StackEvents"]
+        reasons = " ".join(e.get("ResourceStatusReason", "") for e in events)
+        assert "invocation failed" in reasons, reasons
+        assert "blew up before responding" in reasons, reasons
+    finally:
+        try:
+            cfn.delete_stack(StackName="cr-t11")
+            _wait_stack(cfn, "cr-t11")
+        except Exception:
+            pass
+        lam.delete_function(FunctionName="cr-test-raises")
+
+
 # -- Lambda not found -------------------------------------------------------
 
 def test_custom_resource_lambda_not_found(cfn):
