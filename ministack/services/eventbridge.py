@@ -3449,16 +3449,49 @@ def _put_partner_events(data):
 # Permissions (resource policies)
 # ---------------------------------------------------------------------------
 
+def _bus_policy_statement_put(bus_name, statement):
+    """Add ``statement`` to the bus's resource policy, replacing the one that
+    carries the same Sid. PutPermission builds its statement and puts it
+    through here; CloudFormation's AWS::Events::EventBusPolicy puts the one
+    the template carries whole. The policy is created on first use, so
+    DescribeEventBus reads either back."""
+    policy = _event_bus_policies.get(bus_name)
+    if policy is None:
+        policy = _event_bus_policies[bus_name] = {"Version": "2012-10-17", "Statement": []}
+    sid = statement.get("Sid")
+    policy["Statement"] = [s for s in policy["Statement"] if s.get("Sid") != sid]
+    policy["Statement"].append(statement)
+
+
+def _bus_policy_statement_remove(bus_name, statement_id):
+    """Remove the statement with ``statement_id``; the policy itself goes with
+    its last statement, so DescribeEventBus omits Policy again."""
+    policy = _event_bus_policies.get(bus_name)
+    if not policy:
+        return
+    policy["Statement"] = [s for s in policy["Statement"] if s.get("Sid") != statement_id]
+    if not policy["Statement"]:
+        del _event_bus_policies[bus_name]
+
+
 def _put_permission(data):
     bus_name = data.get("EventBusName", "default")
+
+    # The whole-policy form: Policy is a JSON document that replaces the
+    # bus's resource policy, and the statement-building members are ignored.
+    if data.get("Policy"):
+        try:
+            policy = json.loads(data["Policy"])
+        except (TypeError, ValueError):
+            return error_response_json("PolicyLengthExceededException",
+                                       "Policy is not a valid JSON document", 400)
+        if not isinstance(policy, dict) or not isinstance(policy.get("Statement"), list):
+            return error_response_json("PolicyLengthExceededException",
+                                       "Policy must carry a Statement list", 400)
+        _event_bus_policies[bus_name] = policy
+        return json_response({})
+
     statement_id = data.get("StatementId") or new_uuid()
-
-    if bus_name not in _event_bus_policies:
-        _event_bus_policies[bus_name] = {"Version": "2012-10-17", "Statement": []}
-
-    policy = _event_bus_policies[bus_name]
-    policy["Statement"] = [s for s in policy["Statement"] if s.get("Sid") != statement_id]
-
     statement = {
         "Sid": statement_id,
         "Effect": "Allow",
@@ -3469,7 +3502,7 @@ def _put_permission(data):
     condition = data.get("Condition")
     if condition:
         statement["Condition"] = condition
-    policy["Statement"].append(statement)
+    _bus_policy_statement_put(bus_name, statement)
 
     return json_response({})
 
@@ -3483,11 +3516,7 @@ def _remove_permission(data):
         _event_bus_policies.pop(bus_name, None)
         return json_response({})
 
-    if bus_name in _event_bus_policies:
-        policy = _event_bus_policies[bus_name]
-        policy["Statement"] = [s for s in policy["Statement"] if s.get("Sid") != statement_id]
-        if not policy["Statement"]:
-            del _event_bus_policies[bus_name]
+    _bus_policy_statement_remove(bus_name, statement_id)
 
     return json_response({})
 
