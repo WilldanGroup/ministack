@@ -600,6 +600,65 @@ def test_a_finished_build_no_longer_answers_its_session(monkeypatch, tmp_path):
     assert status == 404
 
 
+# The agent's final compose file, as its edit-docker-compose writes it: the
+# build service first, the agent service after it.
+_AGENT_COMPOSE = """services:
+  build:
+    image: ${IMAGE_FOR_CODEBUILD_LOCAL_BUILD}
+    privileged: ${BUILD_CONTAINER_PRIVILEGED_MODE}
+  agent:
+    image: ${LOCAL_AGENT_IMAGE}
+"""
+
+
+def _gnu_sed():
+    import subprocess
+
+    try:
+        return "GNU" in subprocess.run(
+            ["sed", "--version"], capture_output=True, text=True).stdout
+    except OSError:
+        return False
+
+
+def test_the_build_service_reaches_the_host_by_name(monkeypatch, tmp_path):
+    """The agent runs an executable docker-compose ahead of its own that maps
+    host.docker.internal to the host gateway for the build service alone,
+    once, in the file the agent last wrote, and then runs the agent's own."""
+    import subprocess
+
+    container = _FakeContainer(["Phase complete: BUILD State: SUCCEEDED"])
+    docker = _FakeDocker(container)
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: docker)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    project = _execution_project()
+    _seed_execution_build(project, "demo:0012")
+
+    codebuild._execute_build("demo:0012", project)
+
+    mounted = {bind["bind"]: source for source, bind in docker.containers.kwargs["volumes"].items()}
+    wrapper = mounted["/usr/local/sbin/docker-compose"]
+    assert os.access(wrapper, os.X_OK)
+    if not _gnu_sed():
+        pytest.skip("the wrapper runs in the agent's image, whose sed is GNU sed")
+
+    compose = tmp_path / "customer-specific.yml"
+    compose.write_text(_AGENT_COMPOSE, encoding="utf-8")
+    script = (tmp_path / "wrapper.sh")
+    script.write_text(
+        open(wrapper, encoding="utf-8").read()
+        .replace("/LocalBuild/agent-resources/customer-specific.yml", str(compose))
+        .replace("exec /usr/local/bin/docker-compose", "exec echo ran"),
+        encoding="utf-8")
+    for _ in range(2):
+        ran = subprocess.run(["sh", str(script), "up"], capture_output=True, text=True)
+        assert ran.stdout.strip() == "ran up"
+
+    assert compose.read_text(encoding="utf-8") == _AGENT_COMPOSE.replace(
+        "  build:\n",
+        '  build:\n    extra_hosts:\n      - "host.docker.internal:host-gateway"\n')
+
+
 def test_env_file_keeps_an_endpoint_the_project_declared(monkeypatch, tmp_path):
     monkeypatch.setattr(codebuild, "_aws_endpoint", lambda: "http://172.17.0.1:4566")
 
