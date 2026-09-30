@@ -3457,6 +3457,22 @@ def _pool_evict_idle() -> None:
         _kill_pool_entry(e)
 
 
+def _live_container_ids():
+    """Container ids the warm pool still holds.
+
+    Registered with ``core.container_reaper``, so a function container the pool
+    no longer holds — one whose failed start could not be removed, or one that
+    died in the pool and was pruned from it — is reclaimed once it is no longer
+    running. Without it the reaper never judged a Lambda container at all.
+    """
+    with _warm_pool_lock:
+        return {getattr(e.get("container"), "id", None)
+                for entries in _warm_pool.values() for e in entries} - {None}
+
+
+container_reaper.register_live_ids("lambda", _live_container_ids)
+
+
 def _pool_clear_all() -> None:
     """reset()/shutdown — kill every pooled container across all accounts."""
     with _warm_pool_lock:
@@ -4626,28 +4642,38 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
                 return _platform_fallback(f"pull failed: {exc}")
             raise RuntimeError(f"Failed to pull image {image}: {exc}")
 
+    # Always create, then start, holding the container in between: that is all
+    # containers.run() does, but a start that fails there — a daemon call that
+    # times out, a port that will not bind — leaves the created container behind
+    # with no handle to remove it by, and nothing else ever does.
+    container = None
     try:
-        if _use_docker_cp or _cp_layers:
-            create_kwargs = {k: v for k, v in run_kwargs.items()
-                             if k not in ("detach", "stdin_open")}
-            container = client.containers.create(**create_kwargs)
-            # Code: cp'd only in DinD mode (otherwise it's bind-mounted above).
-            if _use_docker_cp:
-                _docker_cp_dir(container, code_dir, "/var/task")
-                if is_provided:
-                    _docker_cp_dir(container, code_dir, "/var/runtime")
-            # Layers: merge each layer's contents directly into /opt, exactly as
-            # AWS does — so /opt/python, /opt/lib, /opt/bin land on the runtime's
-            # standard search paths and the RIE bootstrap finds them with no
-            # shims. arcname="." so the tar carries ./python/... (not
-            # ./layer_N/...); later layers overlay earlier ones, matching AWS
-            # layer ordering. Fixes issue #888.
-            for ld in layers_dirs:
-                _docker_cp_dir(container, ld, "/opt", arcname=".")
-            container.start()
-        else:
-            container = client.containers.run(**run_kwargs)
+        create_kwargs = {k: v for k, v in run_kwargs.items()
+                         if k not in ("detach", "stdin_open")}
+        container = client.containers.create(**create_kwargs)
+        # Code: cp'd only in DinD mode (otherwise it's bind-mounted above).
+        if _use_docker_cp:
+            _docker_cp_dir(container, code_dir, "/var/task")
+            if is_provided:
+                _docker_cp_dir(container, code_dir, "/var/runtime")
+        # Layers: merge each layer's contents directly into /opt, exactly as
+        # AWS does — so /opt/python, /opt/lib, /opt/bin land on the runtime's
+        # standard search paths and the RIE bootstrap finds them with no
+        # shims. arcname="." so the tar carries ./python/... (not
+        # ./layer_N/...); later layers overlay earlier ones, matching AWS
+        # layer ordering. Fixes issue #888.
+        for ld in layers_dirs:
+            _docker_cp_dir(container, ld, "/opt", arcname=".")
+        container.start()
     except Exception as exc:
+        if container is not None:
+            try:
+                container.remove(force=True, v=True)
+            except Exception as remove_exc:
+                # The reaper reclaims it once it is no longer running; the pool
+                # never held it, so it is not a live id.
+                logger.warning("Lambda %s: could not remove a container that failed "
+                               "to start: %s", config.get("FunctionName"), remove_exc)
         if docker_platform:
             return _platform_fallback(f"container create/start failed: {exc}")
         raise
