@@ -3422,6 +3422,7 @@ _AWS_SDK_SERVICE_MAP = {
     "iam": {"protocol": "query"},
     "sts": {"protocol": "query"},
     "cloudwatch": {"protocol": "query", "service_key": "monitoring"},
+    "cloudformation": {"protocol": "query"},
     # REST-JSON services: path-based routing with JSON body
     "rdsdata": {"protocol": "rest-json", "service_key": "rds-data"},
     # REST-XML services: per-op path templates, header/querystring routing, XML responses
@@ -3455,6 +3456,7 @@ _AWS_SDK_ERROR_PREFIX = {
     "iam": "Iam",
     "sts": "Sts",
     "cloudwatch": "CloudWatch",
+    "cloudformation": "CloudFormation",
     "rdsdata": "RdsData",
     "s3": "S3",
     "lambda": "Lambda",
@@ -3715,6 +3717,8 @@ _XML_LIST_WRAPPER_TAGS = frozenset({
     "InstanceProfiles", "ServerCertificateMetadataList", "AccessKeyMetadata",
     "Metrics", "Dimensions", "MetricAlarms", "CompositeAlarms",
     "MetricDataResults", "Datapoints", "QueueUrls",
+    "Stacks", "Outputs", "Capabilities", "Tags", "Changes", "NotificationARNs",
+    "Details", "Summaries",
 })
 _XML_BOOLEAN_FIELDS = frozenset({
     "MultiAZ", "Multiaz", "StorageEncrypted", "DeletionProtection",
@@ -3724,6 +3728,8 @@ _XML_BOOLEAN_FIELDS = frozenset({
     "CrossAccountClone", "CustomerOwnedIpEnabled",
     "IsStorageConfigUpgradeAvailable", "IsWriter", "IsDataLossAllowed",
     "IsTruncated",
+    "NoEcho", "UsePreviousValue", "DisableRollback", "EnableTerminationProtection",
+    "IncludeNestedStacks",
 })
 
 
@@ -4151,17 +4157,13 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
         # Try to extract error from XML
         try:
             root = ET.fromstring(decoded)
-            err_el = root.find(".//{http://rds.amazonaws.com/doc/2014-10-31/}Error")
-            if err_el is None:
-                # Try without namespace
-                err_el = root.find(".//Error")
+            # Query services answer an <Error> in their own namespace (RDS's,
+            # CloudFormation's) or in none, so it is found by its local name.
+            err_el = next((el for el in root.iter() if el.tag.split("}")[-1] == "Error"), None)
             if err_el is not None:
-                code = err_el.findtext("{http://rds.amazonaws.com/doc/2014-10-31/}Code")
-                if code is None:
-                    code = err_el.findtext("Code")
-                msg = err_el.findtext("{http://rds.amazonaws.com/doc/2014-10-31/}Message")
-                if msg is None:
-                    msg = err_el.findtext("Message")
+                fields = {child.tag.split("}")[-1]: child.text for child in err_el}
+                code = fields.get("Code")
+                msg = fields.get("Message")
                 raise _ExecutionError(_prefix_sdk_error(service_name, code or "ServiceException"), msg or decoded)
         except _ExecutionError:
             raise
