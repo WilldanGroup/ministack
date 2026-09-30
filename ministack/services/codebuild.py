@@ -232,6 +232,25 @@ WORKSPACE = "/tmp/ministack-codebuild"
 # and _execute_build reads that exit code as SUCCEEDED.
 CODEBUILD_DOCKER_FLAGS = os.environ.get("CODEBUILD_DOCKER_FLAGS", "")
 
+# A function container reaches the host as host.docker.internal on any engine,
+# because ministack maps that name to the engine's host gateway (lambda_svc).
+# The build container is started by the agent's docker-compose, from a compose
+# file the agent generates and last rewrites itself — edit-docker-compose keeps
+# only the keys it knows — so the build service maps nothing, and on a Linux
+# engine, where only Docker Desktop's resolver answers the name unmapped, a
+# build cannot reach a server on the host. This wrapper, mounted ahead of the
+# agent's docker-compose on its PATH, gives the build service the same mapping
+# in the final file, then runs the agent's own docker-compose.
+_COMPOSE_WRAPPER_PATH = "/usr/local/sbin/docker-compose"
+_COMPOSE_WRAPPER = """#!/bin/sh
+f=/LocalBuild/agent-resources/customer-specific.yml
+if [ -f "$f" ] && ! grep -q 'host.docker.internal:host-gateway' "$f"; then
+  sed -i 's/^  build:$/  build:\\n    extra_hosts:\\n      - "host.docker.internal:host-gateway"/' "$f"
+fi
+exec /usr/local/bin/docker-compose "$@"
+"""
+
+
 _PHASE_COMPLETE_RE = re.compile(r"Phase complete: ([A-Z_]+) State: ([A-Z_]+)")
 
 _docker = None
@@ -518,6 +537,10 @@ def _execute_build(build_id, project):
         with open(buildspec_path, "w", encoding="utf-8") as fh:
             fh.write(buildspec)
         _write_env_file(os.path.join(env_dir, "env.list"), project, build)
+        compose_wrapper = os.path.join(workdir, "docker-compose")
+        with open(compose_wrapper, "w", encoding="utf-8") as fh:
+            fh.write(_COMPOSE_WRAPPER)
+        os.chmod(compose_wrapper, 0o755)
 
         _record_phase(build, "QUEUED", "SUCCEEDED")
         build["buildStatus"] = "IN_PROGRESS"
@@ -538,6 +561,7 @@ def _execute_build(build_id, project):
             volumes={
                 "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"},
                 env_dir: {"bind": "/LocalBuild/envFile", "mode": "ro"},
+                compose_wrapper: {"bind": _COMPOSE_WRAPPER_PATH, "mode": "ro"},
             },
             labels=container_reaper.own_labels("codebuild", **{"ministack.codebuild.build": build_id}),
         )
