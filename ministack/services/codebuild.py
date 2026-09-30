@@ -803,12 +803,34 @@ def _delete_fleet(data):
 # Build handlers
 # ---------------------------------------------------------------------------
 
+def _with_environment_overrides(project, overrides):
+    """The project as one build runs it: each variable in StartBuild's
+    environmentVariablesOverride replaces the declared variable of that name,
+    or is added when none is declared."""
+    if not overrides:
+        return project
+    effective = copy.deepcopy(project)
+    env = effective.setdefault("environment", {})
+    variables = {var.get("name"): var for var in env.get("environmentVariables") or []}
+    for var in overrides:
+        name = var.get("name")
+        if name:
+            variables[name] = {
+                "name": name,
+                "value": var.get("value", ""),
+                "type": var.get("type", "PLAINTEXT"),
+            }
+    env["environmentVariables"] = list(variables.values())
+    return effective
+
+
 def _start_build(data):
     project_name = data.get("projectName", "")
     if not project_name or project_name not in _projects:
         return error_response_json("ResourceNotFoundException",
                                    f"Project not found: {project_name}", 400)
-    project = _projects[project_name]
+    project = _with_environment_overrides(
+        _projects[project_name], data.get("environmentVariablesOverride"))
     bid = _build_id(project_name)
     build = _make_build_record(project, bid, data.get("sourceVersion"))
 
