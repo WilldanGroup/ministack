@@ -536,7 +536,68 @@ def test_env_file_points_the_build_at_ministack(monkeypatch, tmp_path):
 
     lines = env_file.read_text(encoding="utf-8").splitlines()
     assert "AWS_ENDPOINT_URL=http://172.17.0.1:4566" in lines
-    assert "AWS_ACCESS_KEY_ID=test" in lines
+
+
+def _env(env_file):
+    return dict(line.split("=", 1) for line in env_file.read_text(encoding="utf-8").splitlines())
+
+
+def _get_credentials(uri):
+    """GET the build's credential URI through the app's own routing."""
+    import asyncio
+
+    import ministack.app as app_mod
+
+    path = uri.split("4566", 1)[1]
+    status, _headers, body = asyncio.run(
+        app_mod._handle_pre_body_request("GET", path, {}, {}, "req-1"))
+    return status, json.loads(body)
+
+
+def test_env_file_hands_the_build_its_role_session(monkeypatch, tmp_path):
+    """The build reads its project role's session where CodeBuild serves it,
+    and the SDK's own variables carry the same session, never a static key."""
+    from ministack.core.iam_evaluator import resolve_caller_identity
+
+    monkeypatch.setattr(codebuild, "_aws_endpoint", lambda: "http://172.17.0.1:4566")
+    project = _execution_project()
+    build = _seed_execution_build(project, "demo:0009")
+    env_file = tmp_path / "env.list"
+
+    codebuild._write_env_file(str(env_file), project, build)
+
+    env = _env(env_file)
+    uri = env["AWS_CONTAINER_CREDENTIALS_FULL_URI"]
+    assert uri.startswith("http://172.17.0.1:4566/_ministack/codebuild/credentials/")
+    assert env["AWS_ACCESS_KEY_ID"].startswith("ASIA")
+    assert env["AWS_ACCESS_KEY_ID"] != "test"
+    assert env["AWS_SESSION_TOKEN"]
+
+    status, session = _get_credentials(uri)
+    assert status == 200
+    assert session["AccessKeyId"] == env["AWS_ACCESS_KEY_ID"]
+    assert session["SecretAccessKey"] == env["AWS_SECRET_ACCESS_KEY"]
+    assert session["Token"] == env["AWS_SESSION_TOKEN"]
+    assert session["Expiration"].endswith("Z")
+
+    caller = resolve_caller_identity(session["AccessKeyId"])
+    assert caller["userArn"] == (
+        "arn:aws:sts::000000000000:assumed-role/codebuild-role/AWSCodeBuild-0009")
+
+
+def test_a_finished_build_no_longer_answers_its_session(monkeypatch, tmp_path):
+    container = _FakeContainer(["Phase complete: BUILD State: SUCCEEDED"])
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: _FakeDocker(container))
+    monkeypatch.setattr(codebuild, "_aws_endpoint", lambda: "http://172.17.0.1:4566")
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    project = _execution_project()
+    _seed_execution_build(project, "demo:0011")
+
+    codebuild._execute_build("demo:0011", project)
+
+    env = _env(tmp_path / "demo_0011" / "env" / "env.list")
+    status, _answer = _get_credentials(env["AWS_CONTAINER_CREDENTIALS_FULL_URI"])
+    assert status == 404
 
 
 def test_env_file_keeps_an_endpoint_the_project_declared(monkeypatch, tmp_path):
