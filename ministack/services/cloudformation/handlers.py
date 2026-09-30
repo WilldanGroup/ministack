@@ -360,6 +360,7 @@ def _create_stack(params):
         "_template_body": template_body,
         "_resolved_params": param_values,
         "_conditions": conditions,
+        "_client_request_token": _p(params, "ClientRequestToken", ""),
     }
     _stacks[stack_name] = stack
     _stack_events[stack_id] = []
@@ -919,6 +920,7 @@ def _delete_stack(params):
     if _p(params, "DeletionMode"):
         stack["DeletionMode"] = _p(params, "DeletionMode")
 
+    stack["_client_request_token"] = _p(params, "ClientRequestToken", "")
     _create_stack_task_in_region(
         _delete_stack_async(stack_name, stack_id, frozenset(retain), force=force),
         stack,
@@ -1070,6 +1072,7 @@ def _update_stack(params):
     stack["StackStatus"] = "UPDATE_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
+    stack["_client_request_token"] = _p(params, "ClientRequestToken", "")
     # The capabilities a stack reports are the ones its last operation
     # acknowledged, so an update replaces them rather than adding to them.
     stack["Capabilities"] = _extract_string_members(params, "Capabilities")

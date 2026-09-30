@@ -779,6 +779,7 @@ def _execute_change_set(params):
     stack["StackStatus"] = f"{status_prefix}_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
+    stack["_client_request_token"] = _p(params, "ClientRequestToken", "")
     # The stack reports what the operation acknowledged, and for an executed
     # change set that is what the change set was created with.
     stack["Capabilities"] = list(cs.get("Capabilities", []))

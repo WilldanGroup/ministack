@@ -7,11 +7,21 @@ CloudFormation stacks — async stack lifecycle (deploy, delete, update, diff).
 import asyncio
 import contextvars
 import copy
+import json
 import logging
+import time
 from contextlib import contextmanager
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.responses import get_region, new_uuid, now_iso, set_request_region
+from ministack.core.responses import (
+    _request_account_id,
+    _request_region,
+    get_region,
+    new_uuid,
+    now_iso,
+    set_request_region,
+)
 
 from .engine import (
     _NO_VALUE,
@@ -133,8 +143,10 @@ CLIENT_REQUEST_TOKEN = contextvars.ContextVar("cfn_client_request_token", defaul
 
 def _add_event(stack_id, stack_name, logical_id, resource_type, status,
                reason="", physical_id=""):
-    """Record a stack event."""
+    """Record a stack event. One that is the stack's own status change also
+    goes to the default event bus, as CloudFormation sends it."""
     from ministack.services.cloudformation import _stack_events
+    token = _operation_token(stack_name)
     event = {
         "StackId": stack_id,
         "StackName": stack_name,
@@ -146,12 +158,70 @@ def _add_event(stack_id, stack_name, logical_id, resource_type, status,
         "ResourceStatusReason": reason,
         "Timestamp": now_iso(),
     }
-    token = CLIENT_REQUEST_TOKEN.get()
+    # The running operation's token (the request handler's context), else
+    # the one recorded on the stack's root for its current operation.
+    token = CLIENT_REQUEST_TOKEN.get() or token
     if token:
         event["ClientRequestToken"] = token
     if stack_id not in _stack_events:
         _stack_events[stack_id] = []
     _stack_events[stack_id].append(event)
+    if resource_type == "AWS::CloudFormation::Stack" and logical_id == stack_name:
+        _send_stack_status_change(stack_id, status, reason, token)
+
+
+def _operation_token(stack_name):
+    """The ``ClientRequestToken`` of the operation a stack's event belongs to.
+
+    AWS assigns every event a stack operation initiates that operation's token
+    (the ``client-request-token`` of the Stack Status Change event detail,
+    AWS CloudFormation User Guide), so a nested stack's events carry the token
+    its root stack's operation was given: the child is walked up to its root.
+    """
+    from ministack.services.cloudformation import _stacks
+    stack = _stacks.get(stack_name)
+    seen = set()
+    while stack is not None and stack.get("_parent_stack_name") and stack_name not in seen:
+        seen.add(stack_name)
+        stack_name = stack["_parent_stack_name"]
+        stack = _stacks.get(stack_name)
+    return (stack or {}).get("_client_request_token", "") or ""
+
+
+def _send_stack_status_change(stack_id, status, reason, token):
+    """The ``CloudFormation Stack Status Change`` event, on the default bus of
+    the stack's own account and region, in the shape the AWS CloudFormation
+    User Guide documents (Stack Status Change event detail). A delivery that
+    fails is logged; it never fails the stack operation."""
+    from ministack.services import eventbridge as _eb
+    try:
+        spec = parse_arn(stack_id)
+    except ArnParseError:
+        return
+    event = {
+        "EventId": new_uuid(),
+        "Source": "aws.cloudformation",
+        "DetailType": "CloudFormation Stack Status Change",
+        "Detail": json.dumps({
+            "stack-id": stack_id,
+            "status-details": {"status": status, "status-reason": reason or ""},
+            "client-request-token": token or "",
+        }),
+        "EventBusName": "default",
+        "Time": int(time.time()),
+        "Resources": [stack_id],
+        "Account": spec.account_id,
+        "Region": spec.region,
+    }
+    account_token = _request_account_id.set(spec.account_id)
+    region_token = _request_region.set(spec.region)
+    try:
+        _eb._dispatch_event(event)
+    except Exception:
+        logger.exception("CloudFormation -> EventBridge: %s %s was not delivered", stack_id, status)
+    finally:
+        _request_region.reset(region_token)
+        _request_account_id.reset(account_token)
 
 
 # ===========================================================================
