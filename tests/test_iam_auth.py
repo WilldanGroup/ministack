@@ -3520,6 +3520,141 @@ class TestKmsAliasAuthorization:
         assert not created
 
 
+
+class TestKmsKeyNamedByAlias:
+    """A KMS call that names its key by alias is authorized against the key
+    the alias names, and each key checked carries the alias names that name
+    it as kms:ResourceAliases, whatever the request called it. UpdateAlias is
+    authorized against the key the alias names now as well as the key it
+    will name. Before, an alias-named call was checked against the alias ARN,
+    UpdateAlias never against the key the alias left, and no KMS condition
+    key was supplied, so a statement bounded by kms:ResourceAliases never
+    matched."""
+
+    _ACCOUNT = "000000000000"
+    _REGION = "us-east-1"
+    _ROLE = "kms-alias-resolution-probe"
+    _SESSION = "ASIAKMSALIASRESOLVE1"
+    _dispatch = staticmethod(TestKmsAliasAuthorization._dispatch)
+
+    def _alias_arn(self, name):
+        return f"arn:aws:kms:{self._REGION}:{self._ACCOUNT}:{name}"
+
+    @pytest.fixture
+    def world(self, monkeypatch):
+        """Keys and aliases made as root, and one role's session to call as."""
+        import types
+
+        import ministack.app as app
+        from ministack.services import iam as iam_svc
+        from ministack.services import kms as kms_svc
+        from ministack.services import sts as sts_svc
+
+        monkeypatch.setattr(app, "AUTH", True)
+        key_ids, alias_arns = [], []
+
+        def key():
+            status, _, body = self._dispatch("test", "CreateKey", {})
+            assert status == 200, body
+            meta = json.loads(body)["KeyMetadata"]
+            key_ids.append(meta["KeyId"])
+            return meta["Arn"]
+
+        def alias(name, key_arn):
+            status, _, body = self._dispatch(
+                "test", "CreateAlias", {"AliasName": name, "TargetKeyId": key_arn})
+            assert status == 200, body
+            alias_arns.append(self._alias_arn(name))
+
+        def named(name):
+            key_id = kms_svc._aliases.get_scoped(
+                self._ACCOUNT, self._REGION, self._alias_arn(name))
+            return f"arn:aws:kms:{self._REGION}:{self._ACCOUNT}:key/{key_id}"
+
+        def role(statements):
+            iam_svc._roles[self._ROLE] = {
+                "RoleName": self._ROLE,
+                "Arn": f"arn:aws:iam::{self._ACCOUNT}:role/{self._ROLE}",
+                "RoleId": "AROAKMSALIASRESOLVE", "CreateDate": "2026-01-01", "Path": "/",
+                "AssumeRolePolicyDocument": "{}", "AttachedPolicies": [], "Tags": [],
+                "InlinePolicies": {"kms": json.dumps({"Statement": statements})},
+            }
+            sts_svc.register_session(self._SESSION, {
+                "Arn": f"arn:aws:sts::{self._ACCOUNT}:assumed-role/{self._ROLE}/probe",
+                "UserId": "AROAKMSALIASRESOLVE:probe",
+                "SecretAccessKey": "s", "SessionToken": "t",
+                "Expiration": time.time() + 3600,
+                "AccountId": self._ACCOUNT, "PrincipalType": "AssumedRole",
+                "SourceAccessKeyId": "test",
+                "SourcePrincipalArn": f"arn:aws:iam::{self._ACCOUNT}:root",
+            })
+            return self._SESSION
+
+        try:
+            yield types.SimpleNamespace(key=key, alias=alias, named=named, role=role)
+        finally:
+            sts_svc._sessions.pop(self._SESSION, None)
+            iam_svc._roles.pop(self._ROLE, None)
+            for alias_arn in alias_arns:
+                kms_svc._aliases.pop(alias_arn, None)
+                kms_svc._alias_dates.pop(alias_arn, None)
+            for key_id in key_ids:
+                kms_svc._keys.pop(key_id, None)
+
+    def _through_alias(self, action, alias_name):
+        """``action`` on any key in the region while it carries ``alias_name``."""
+        return {
+            "Effect": "Allow", "Action": action,
+            "Resource": f"arn:aws:kms:{self._REGION}:{self._ACCOUNT}:key/*",
+            "Condition": {"ForAnyValue:StringEquals": {"kms:ResourceAliases": alias_name}},
+        }
+
+    def test_a_grant_through_an_alias_reaches_the_key_it_names_and_no_other(self, world):
+        a, b = world.key(), world.key()
+        world.alias("alias/probe-a", a)
+        world.alias("alias/probe-b", b)
+        session = world.role([self._through_alias("kms:DescribeKey", "alias/probe-a")])
+
+        status, _, body = self._dispatch(session, "DescribeKey", {"KeyId": "alias/probe-a"})
+        assert status == 200, body
+        assert json.loads(body)["KeyMetadata"]["Arn"] == a
+        status, _, body = self._dispatch(session, "DescribeKey", {"KeyId": a})
+        assert status == 200, body
+
+        status, _, body = self._dispatch(session, "DescribeKey", {"KeyId": "alias/probe-b"})
+        assert status == 403, body
+        assert b"AccessDeniedException" in body and b"kms:DescribeKey" in body
+
+    def test_update_alias_is_refused_without_the_key_the_alias_names_now(self, world):
+        old, new = world.key(), world.key()
+        world.alias("alias/probe-a", old)
+        session = world.role([{
+            "Effect": "Allow", "Action": "kms:UpdateAlias",
+            "Resource": [self._alias_arn("alias/probe-a"), new],
+        }])
+
+        status, _, body = self._dispatch(
+            session, "UpdateAlias", {"AliasName": "alias/probe-a", "TargetKeyId": new})
+        assert status == 403, body
+        assert b"AccessDeniedException" in body and b"kms:UpdateAlias" in body
+        assert world.named("alias/probe-a") == old
+
+    def test_update_alias_moves_it_off_a_key_reached_through_the_alias(self, world):
+        old, new = world.key(), world.key()
+        world.alias("alias/probe-a", old)
+        session = world.role([
+            {
+                "Effect": "Allow", "Action": "kms:UpdateAlias",
+                "Resource": [self._alias_arn("alias/probe-a"), new],
+            },
+            self._through_alias("kms:UpdateAlias", "alias/probe-a"),
+        ])
+
+        status, _, body = self._dispatch(
+            session, "UpdateAlias", {"AliasName": "alias/probe-a", "TargetKeyId": new})
+        assert status == 200, body
+        assert world.named("alias/probe-a") == new
+
 def test_lambda_create_function_with_a_missing_role_answers_400(monkeypatch):
     """The role check must reach the client, not blow up inside _build_config."""
     import io
