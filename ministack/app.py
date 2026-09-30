@@ -2423,6 +2423,7 @@ async def _dispatch_service_request(
             extract_iam_action,
             extract_resource_arn,
             kms_resource_arns,
+            kms_service_context,
         )
         from ministack.core.iam_evaluator import AuthError, enforce, pin_request_caller
         from ministack.core.responses import get_account_id
@@ -2434,9 +2435,12 @@ async def _dispatch_service_request(
             resource_arn = extract_resource_arn(
                 service, method, path, headers, body, routing_params, region, get_account_id()
             )
-            service_context = (
-                dynamodb_service_context(body) if service == "dynamodb" else None
-            )
+            if service == "dynamodb":
+                service_context = dynamodb_service_context(body)
+            elif service == "kms":
+                service_context = kms_service_context(resource_arn)
+            else:
+                service_context = None
             denied = enforce(
                 access_key, iam_action, service, region,
                 resource_arn=resource_arn, service_context=service_context,
@@ -2480,12 +2484,15 @@ async def _dispatch_service_request(
                     if denied:
                         break
             # An alias call is authorized against the key it names and the
-            # alias itself; both must be allowed.
+            # alias itself, and UpdateAlias against the key the alias names
+            # now as well; each must be allowed, each key with its own aliases.
             if service == "kms" and not denied:
-                for extra_arn in kms_resource_arns(body, region, get_account_id())[1:]:
+                for extra_arn in kms_resource_arns(
+                        body, region, get_account_id(), iam_action)[1:]:
                     denied = enforce(
                         access_key, iam_action, service, region,
                         resource_arn=extra_arn,
+                        service_context=kms_service_context(extra_arn),
                     )
                     if denied:
                         break

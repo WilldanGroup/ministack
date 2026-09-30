@@ -1637,26 +1637,74 @@ def _kms_arn(key_id: str, region: str, account_id: str) -> str:
     return f"arn:aws:kms:{region}:{account_id}:key/{key_id}"
 
 
-def kms_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
+def _kms_alias_target_arn(alias_arn: str) -> str:
+    """The ARN of the key an alias ARN names, in the alias's own account and
+    region, or the alias ARN itself when the alias names no key — the service
+    then answers NotFoundException."""
+    from ministack.services import kms as kms_svc
+
+    parts = alias_arn.split(":", 5)
+    if len(parts) != 6 or not parts[5].startswith("alias/"):
+        return alias_arn
+    _, partition, _, region, account_id, _ = parts
+    key_id = kms_svc._aliases.get_scoped(account_id, region, alias_arn)
+    if not key_id:
+        return alias_arn
+    return f"arn:{partition}:kms:{region}:{account_id}:key/{key_id}"
+
+
+def kms_resource_arns(body: bytes, region: str, account_id: str,
+                      iam_action: str = "") -> list[str]:
     """Every resource a KMS call is authorized against, the key first.
 
     Most calls name their key as KeyId; Decrypt, and ReEncrypt's source key,
     carry none for a symmetric key and the key is recovered from the
-    ciphertext. The alias calls — CreateAlias, UpdateAlias — name the key as
-    TargetKeyId and the alias as AliasName, and AWS authorizes them against
-    both (kms:CreateAlias on the alias ARN and on the key ARN, per the KMS
-    permissions reference); DeleteAlias names the alias alone.
+    ciphertext. A key named by alias, by name or ARN, is authorized against
+    the key the alias names, as AWS authorizes it. The alias calls —
+    CreateAlias, UpdateAlias — name the key as TargetKeyId and the alias as
+    AliasName, and AWS authorizes them against both (kms:CreateAlias on the
+    alias ARN and on the key ARN, per the KMS permissions reference);
+    UpdateAlias is authorized against the key the alias names now as well.
+    DeleteAlias names the alias alone.
     """
     arns: list[str] = []
     key_id = _safe_json_field(body, "KeyId") or _safe_json_field(body, "TargetKeyId")
     if not key_id:
         key_id = _kms_key_id_from_ciphertext(_safe_json_field(body, "CiphertextBlob"))
     if key_id:
-        arns.append(_kms_arn(key_id, region, account_id))
+        arns.append(_kms_alias_target_arn(_kms_arn(key_id, region, account_id)))
     alias_name = _safe_json_field(body, "AliasName")
     if alias_name:
-        arns.append(_kms_arn(alias_name, region, account_id))
+        alias_arn = _kms_arn(alias_name, region, account_id)
+        arns.append(alias_arn)
+        if iam_action == "kms:UpdateAlias":
+            current_arn = _kms_alias_target_arn(alias_arn)
+            if current_arn != alias_arn:
+                arns.append(current_arn)
     return arns
+
+
+def kms_service_context(resource_arn: str) -> dict:
+    """The KMS condition keys a check against ``resource_arn`` carries.
+
+    ``kms:ResourceAliases`` is the alias names (``alias/...``) that name the
+    key in its own account and region, whatever the request called the key.
+    It is per resource: UpdateAlias checks the key the alias names now and
+    the key it will name, and the two carry different aliases. An alias
+    resource carries no condition key, as AWS supplies none for one.
+    """
+    from ministack.services import kms as kms_svc
+
+    parts = resource_arn.split(":", 5)
+    if len(parts) != 6 or parts[2] != "kms" or not parts[5].startswith("key/"):
+        return {}
+    _, _, _, region, account_id, resource = parts
+    key_id = resource[len("key/"):]
+    return {"kms:ResourceAliases": sorted(
+        alias_arn.split(":", 5)[5]
+        for alias_arn, target_id in kms_svc._aliases.items_scoped(account_id, region)
+        if target_id == key_id
+    )}
 
 
 def eventbridge_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
