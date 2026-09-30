@@ -10,8 +10,10 @@ SDK surface:
   StartPipe, StopPipe, ListTagsForResource, TagResource, UntagResource
 
 Runtime (background poller + CloudFormation) scope is intentionally limited to:
-- Source: DynamoDB Streams
-- Target: SNS, Step Functions state machine
+- Source: DynamoDB Streams, with FilterCriteria and BatchSize
+- Enrichment: Lambda
+- Target: SNS, Step Functions state machine, EventBridge event bus (with
+  EventBridgeEventBusParameters and InputTemplate)
 """
 
 import copy
@@ -146,6 +148,10 @@ def register_pipe(
     starting_position: str = "LATEST",
     tags: dict | None = None,
     description: str = "",
+    source_parameters: dict | None = None,
+    enrichment: str = "",
+    enrichment_parameters: dict | None = None,
+    target_parameters: dict | None = None,
 ):
     pipe_region = get_region()
     # AWS rejects cross-region source/target ARNs before role validation.
@@ -156,6 +162,9 @@ def register_pipe(
             continue
         if component_region and component_region != pipe_region:
             raise ValueError(CROSS_REGION_PIPE_ERROR)
+    filter_error = _filter_criteria_error(source_parameters)
+    if filter_error:
+        raise ValueError(filter_error)
 
     arn = f"arn:aws:pipes:{pipe_region}:{get_account_id()}:pipe/{name}"
     state = "STOPPED" if str(desired_state).upper() == "STOPPED" else "RUNNING"
@@ -178,10 +187,59 @@ def register_pipe(
         "CreationTime": now,
         "LastModifiedTime": now,
     }
+    _set_pipe_parameters(
+        _pipes[name],
+        source_parameters=source_parameters,
+        enrichment=enrichment,
+        enrichment_parameters=enrichment_parameters,
+        target_parameters=target_parameters,
+    )
     _positions[arn] = _initial_position(_pipes[name])
 
     _ensure_poller()
     return _pipes[name]
+
+
+def _set_pipe_parameters(pipe: dict, **parameters) -> None:
+    """Store the optional pipe members as the API returns them: present when
+    set, absent otherwise (DescribePipe omits an unset member)."""
+    members = {
+        "source_parameters": "SourceParameters",
+        "enrichment": "Enrichment",
+        "enrichment_parameters": "EnrichmentParameters",
+        "target_parameters": "TargetParameters",
+    }
+    for arg, member in members.items():
+        if arg not in parameters:
+            continue
+        value = parameters[arg]
+        if value:
+            pipe[member] = copy.deepcopy(value)
+        else:
+            pipe.pop(member, None)
+
+
+def _filter_patterns(pipe_or_parameters: dict | None) -> list:
+    """The FilterCriteria patterns of a pipe record or of its SourceParameters."""
+    params = pipe_or_parameters or {}
+    if "SourceParameters" in params:
+        params = params.get("SourceParameters") or {}
+    criteria = params.get("FilterCriteria") or {} if isinstance(params, dict) else {}
+    filters = criteria.get("Filters") or [] if isinstance(criteria, dict) else []
+    return [f.get("Pattern") for f in filters if isinstance(f, dict) and "Pattern" in f]
+
+
+def _filter_criteria_error(source_parameters: dict | None) -> str:
+    """Why a FilterCriteria pattern cannot be applied, or "" when every one can.
+    A filter pattern is an EventBridge event pattern; one the pattern compiler
+    refuses is refused here instead of silently matching nothing."""
+    from ministack.services import eventbridge as _eb
+
+    for pattern in _filter_patterns(source_parameters):
+        _alternatives, reason = _eb._parse_pattern_text(pattern)
+        if reason:
+            return f"Invalid FilterCriteria pattern {pattern!r}: {reason}"
+    return ""
 
 
 def delete_pipe(name: str):
@@ -247,27 +305,217 @@ def _poll_pipe(_ddb, pipe: dict, pipe_account_id: str) -> None:
     if pos >= end:
         return
 
-    batch = _ddb.stream_records_since(table_name, pos, end - pos, **scope)
+    count = end - pos
+    batch_size = _batch_size(pipe)
+    if batch_size:
+        count = min(count, batch_size)
+    batch = _ddb.stream_records_since(table_name, pos, count, **scope)
     if _deliver_batch(pipe, batch):
         _positions[pipe["Arn"]] = pos + len(batch)
+
+
+def _batch_size(pipe: dict) -> int:
+    """DynamoDBStreamParameters.BatchSize, or 0 when the pipe sets none."""
+    params = (pipe.get("SourceParameters") or {}).get("DynamoDBStreamParameters") or {}
+    try:
+        return max(0, int(params.get("BatchSize") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _deliver_batch(pipe: dict, batch: list) -> bool:
     """True once every record in the batch has reached the target. A batch that
     did not is left on the stream: the position stays on it and the next poll
-    retries it, until the records age out of the retention window."""
+    retries it, until the records age out of the retention window.
+
+    The batch goes through the pipe's stages in order: the records no filter
+    admits are dropped, the rest go to the enrichment when there is one, and
+    what the enrichment answers is what the target receives. A batch the
+    filter empties, or one the enrichment maps to an empty array, has reached
+    its target: there is nothing to deliver."""
     target_arn = pipe.get("Target", "")
     target_service = _arn_service(target_arn)
-    if target_service == "states":
-        return _start_state_machine_from_records(target_arn, pipe, batch)
-    if target_service == "sns":
-        for rec in batch:
-            _publish_record_to_sns(target_arn, pipe, rec)
+    if target_service not in ("states", "sns", "events"):
+        logger.warning(
+            "Pipes %s: holding %d record(s); MiniStack delivers to sns, states "
+            "and events, not to %s", pipe.get("Name"), len(batch),
+            target_service or target_arn)
+        return False
+
+    events = _filtered_records(pipe, batch)
+    if not events:
         return True
-    logger.warning(
-        "Pipes %s: holding %d record(s); MiniStack delivers to sns and states, "
-        "not to %s", pipe.get("Name"), len(batch), target_service or target_arn)
-    return False
+    if pipe.get("Enrichment"):
+        enriched, events = _enrich(pipe, events)
+        if not enriched:
+            return False
+        if not events:
+            return True
+
+    if target_service == "states":
+        return _start_state_machine_from_records(target_arn, pipe, events)
+    if target_service == "events":
+        return _put_events_on_bus(target_arn, pipe, events)
+    for rec in events:
+        _publish_record_to_sns(target_arn, pipe, rec)
+    return True
+
+
+def _filtered_records(pipe: dict, records: list) -> list:
+    """The records at least one FilterCriteria pattern matches; all of them
+    when the pipe has no filter. A pattern is matched against the whole
+    record, so a DynamoDB filter names ``dynamodb``, ``eventName`` and so on."""
+    patterns = _filter_patterns(pipe)
+    if not patterns:
+        return list(records)
+    from ministack.services import eventbridge as _eb
+
+    def admitted(record):
+        for pattern in patterns:
+            alternatives = _eb._compiled_pattern(pattern) if isinstance(pattern, str) else None
+            if alternatives and any(_eb._matches_detail(record, alt) for alt in alternatives):
+                return True
+        return False
+
+    return [record for record in records if admitted(record)]
+
+
+def _enrich(pipe: dict, records: list) -> tuple[bool, list]:
+    """Invoke the enrichment function synchronously with the batch, as a JSON
+    array, and answer ``(True, events)`` with what it returned — an array is
+    the batch, anything else one event — or ``(False, [])`` when it did not
+    answer, which holds the batch on the stream."""
+    enrichment_arn = pipe.get("Enrichment", "")
+    if _arn_service(enrichment_arn) != "lambda":
+        logger.warning("Pipes %s: holding %d record(s); MiniStack enriches with "
+                       "lambda, not %s", pipe.get("Name"), len(records), enrichment_arn)
+        return False, []
+    from ministack.services import lambda_svc
+
+    func, config, func_name = lambda_svc._get_func_record_for_ref(enrichment_arn)
+    if not func or not config:
+        logger.warning("Pipes %s: enrichment function %s not found",
+                       pipe.get("Name"), func_name)
+        return False, []
+    result = lambda_svc._execute_function_with_config_scope(
+        lambda_svc._execution_record_for_config(func, config), records)
+    if result.get("error"):
+        logger.warning("Pipes %s: enrichment %s failed: %s",
+                       pipe.get("Name"), func_name, result.get("body"))
+        return False, []
+    body = result.get("body")
+    if isinstance(body, (bytes, str)):
+        try:
+            body = json.loads(body) if body else None
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if body is None:
+        return True, []
+    return True, body if isinstance(body, list) else [body]
+
+
+def _json_path_value(path: str, document):
+    """The value a Pipes JSON path (``$``, ``$.a.b``, ``$.a[0]``) names in
+    ``document``, and whether it resolved."""
+    if path == "$":
+        return document, True
+    if not path.startswith("$."):
+        return None, False
+    value = document
+    for part in path[2:].split("."):
+        name, _, rest = part.partition("[")
+        try:
+            if name:
+                value = value[name]
+            while rest:
+                index, _, rest = rest.partition("]")
+                value = value[int(index)]
+                rest = rest[1:] if rest.startswith("[") else rest
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None, False
+    return value, True
+
+
+def _parameter_value(value, event):
+    """A target parameter as the target reads it: a string beginning ``$.`` is
+    a dynamic path parameter, read off the event; anything else is literal.
+    ``None`` when a dynamic path does not resolve."""
+    if isinstance(value, str) and value.startswith("$."):
+        resolved, found = _json_path_value(value, event)
+        return resolved if found else None
+    return value
+
+
+def _render_target_input(template: str, event) -> str:
+    """The pipe's InputTemplate rendered against one event: each ``<$.path>``
+    placeholder is replaced by what the path names, the way EventBridge renders
+    an input transformer's template — a string outside quotes verbatim, an
+    object or array in a string with its quotes dropped. A placeholder whose
+    path does not resolve stays as written."""
+    from ministack.services import eventbridge as _eb
+
+    replacements = {}
+    for token in _eb._PLACEHOLDER_RE.findall(template):
+        if token.startswith("$"):
+            value, found = _json_path_value(token, event)
+            if found:
+                replacements[token] = value
+    return _eb._render_input_template(template, replacements)
+
+
+def _put_events_on_bus(bus_arn: str, pipe: dict, events: list) -> bool:
+    """Put one entry per event on the target bus through PutEvents, so the
+    bus's rules, archives and targets see them as any other put.
+
+    Every entry is built before any is put: an entry whose Source or
+    DetailType path does not resolve, or whose Detail is not a JSON object
+    (PutEvents' ``MalformedDetail``), holds the whole batch, so a retry does
+    not put its good neighbours twice."""
+    from ministack.services import eventbridge as _eb
+
+    params = pipe.get("TargetParameters") or {}
+    bus_params = params.get("EventBridgeEventBusParameters") or {}
+    template = params.get("InputTemplate")
+    entries = []
+    for event in events:
+        source = _parameter_value(bus_params.get("Source", ""), event)
+        detail_type = _parameter_value(bus_params.get("DetailType", ""), event)
+        if source is None or detail_type is None:
+            logger.warning("Pipes %s: holding the batch; a dynamic path in "
+                           "EventBridgeEventBusParameters does not resolve on %s",
+                           pipe.get("Name"), json.dumps(event, default=str)[:200])
+            return False
+        if template is not None:
+            detail = _render_target_input(template, event)
+        else:
+            detail = json.dumps(event)
+        try:
+            parsed = json.loads(detail)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if not isinstance(parsed, dict):
+            logger.warning("Pipes %s: holding the batch; MalformedDetail — the "
+                           "target input is not a JSON object: %s",
+                           pipe.get("Name"), str(detail)[:200])
+            return False
+        entry = {
+            "EventBusName": bus_arn,
+            "Source": str(source),
+            "DetailType": str(detail_type),
+            "Detail": detail,
+        }
+        if bus_params.get("Resources"):
+            entry["Resources"] = list(bus_params["Resources"])
+        entries.append(entry)
+
+    for start in range(0, len(entries), 10):
+        status, _headers, body = _eb._put_events({"Entries": entries[start:start + 10]})
+        answer = json.loads(body) if status < 400 and body else {}
+        if status >= 400 or answer.get("FailedEntryCount"):
+            logger.warning("Pipes %s: PutEvents on %s failed (%s): %s",
+                           pipe.get("Name"), bus_arn, status, body)
+            return False
+    return True
 
 
 def _start_state_machine_from_records(sm_arn: str, pipe: dict, records: list) -> bool:
@@ -463,7 +711,11 @@ def _describe_response(pipe):
         "Tags": pipe.get("Tags", {}) or {},
         "CreationTime": int(pipe.get("CreationTime", 0)),
         "LastModifiedTime": int(pipe.get("LastModifiedTime", pipe.get("CreationTime", 0))),
+        **{member: pipe[member] for member in _OPTIONAL_MEMBERS if pipe.get(member)},
     }
+
+
+_OPTIONAL_MEMBERS = ("SourceParameters", "Enrichment", "EnrichmentParameters", "TargetParameters")
 
 
 def _find_pipe_by_arn(arn):
@@ -495,10 +747,20 @@ def _create_pipe(name, body):
             desired_state=desired,
             tags=body.get("Tags") or {},
             description=body.get("Description", "") or "",
+            starting_position=_starting_position(body.get("SourceParameters")),
+            source_parameters=body.get("SourceParameters") or None,
+            enrichment=body.get("Enrichment", "") or "",
+            enrichment_parameters=body.get("EnrichmentParameters") or None,
+            target_parameters=body.get("TargetParameters") or None,
         )
     except ValueError as e:
         return _error(400, "ValidationException", str(e))
     return _json_resp(200, _lifecycle_response(pipe))
+
+
+def _starting_position(source_parameters) -> str:
+    params = (source_parameters or {}).get("DynamoDBStreamParameters") or {}
+    return params.get("StartingPosition") or "LATEST"
 
 
 def _describe_pipe(name):
@@ -512,12 +774,25 @@ def _update_pipe(name, body):
     pipe = _pipes.get(name)
     if pipe is None:
         return _not_found(name)
+    filter_error = _filter_criteria_error(body.get("SourceParameters"))
+    if filter_error:
+        return _error(400, "ValidationException", filter_error)
     if "Description" in body:
         pipe["Description"] = body.get("Description", "") or ""
     if "RoleArn" in body:
         pipe["RoleArn"] = body.get("RoleArn", "") or ""
     if "Target" in body and body.get("Target"):
         pipe["Target"] = body["Target"]
+    _set_pipe_parameters(pipe, **{
+        arg: body.get(member)
+        for arg, member in (
+            ("source_parameters", "SourceParameters"),
+            ("enrichment", "Enrichment"),
+            ("enrichment_parameters", "EnrichmentParameters"),
+            ("target_parameters", "TargetParameters"),
+        )
+        if member in body
+    })
     if "DesiredState" in body:
         desired = str(body.get("DesiredState", "")).upper()
         if desired not in _VALID_REQUESTED_STATE:

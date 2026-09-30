@@ -5677,7 +5677,7 @@ def _lambda_event_invoke_config_delete(physical_id, props):
         )
 
 
-# --- EventBridge Pipes (minimal: DynamoDB Streams -> SNS) ---
+# --- EventBridge Pipes (DynamoDB Streams -> SNS, Step Functions or an event bus) ---
 
 def _pipes_pipe_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
@@ -5697,8 +5697,44 @@ def _pipes_pipe_create(logical_id, props, stack_name):
         role_arn=role_arn,
         desired_state=desired_state,
         starting_position=starting_position,
+        description=props.get("Description", "") or "",
+        source_parameters=source_params or None,
+        enrichment=props.get("Enrichment", "") or "",
+        enrichment_parameters=props.get("EnrichmentParameters") or None,
+        target_parameters=props.get("TargetParameters") or None,
     )
     return name, {"Arn": pipe["Arn"], "Name": name}
+
+
+def _pipes_pipe_update(physical_id, old_props, new_props, stack_name, logical_id):
+    """Name and Source replace the pipe, as they do in AWS; any other change is
+    made to the standing pipe, which keeps its place on the stream."""
+    replaced = any(old_props.get(key) != new_props.get(key) for key in ("Name", "Source"))
+    pipe = _pipes._pipes.get(physical_id)
+    if replaced or pipe is None:
+        _pipes.delete_pipe(physical_id)
+        return _pipes_pipe_create(logical_id, new_props, stack_name)
+    filter_error = _pipes._filter_criteria_error(new_props.get("SourceParameters"))
+    if filter_error:
+        raise ValueError(filter_error)
+    desired_state = str(new_props.get("DesiredState", "RUNNING")).upper()
+    pipe.update({
+        "Target": new_props.get("Target", ""),
+        "RoleArn": new_props.get("RoleArn", ""),
+        "Description": new_props.get("Description", "") or "",
+        "DesiredState": desired_state,
+        "CurrentState": desired_state,
+        "LastModifiedTime": int(time.time()),
+    })
+    _pipes._set_pipe_parameters(
+        pipe,
+        source_parameters=new_props.get("SourceParameters") or None,
+        enrichment=new_props.get("Enrichment", "") or "",
+        enrichment_parameters=new_props.get("EnrichmentParameters") or None,
+        target_parameters=new_props.get("TargetParameters") or None,
+    )
+    _pipes._pipes[physical_id] = pipe
+    return physical_id, {"Arn": pipe["Arn"], "Name": physical_id}
 
 
 def _pipes_pipe_delete(physical_id, props):
@@ -12864,7 +12900,12 @@ _RESOURCE_HANDLERS = {
         "update": _lambda_event_invoke_config_update,
         "delete": _lambda_event_invoke_config_delete,
     },
-    "AWS::Pipes::Pipe": {"create": _pipes_pipe_create, "delete": _pipes_pipe_delete},
+    "AWS::Pipes::Pipe": {
+        "create": _pipes_pipe_create,
+        "update": _pipes_pipe_update,
+        "update_with_logical_id": True,
+        "delete": _pipes_pipe_delete,
+    },
     "AWS::Lambda::Alias": {
         "create": _lambda_alias_create,
         "update": _lambda_alias_update,
