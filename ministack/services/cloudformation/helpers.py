@@ -7,7 +7,7 @@ CloudFormation helpers — XML response formatting and parameter extraction util
 import logging
 import re
 from html import escape as _esc
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from ministack.core.responses import new_uuid
 
@@ -229,6 +229,31 @@ def _resolve_template(params):
     return _resolve_document(params, "TemplateBody", "TemplateURL", "Template")
 
 
+# A virtual-hosted S3 address names its bucket in the host: bucket.s3.amazonaws.com,
+# bucket.s3.<region>.amazonaws.com, the legacy bucket.s3-<region>.amazonaws.com
+# and the dual-stack form. A bucket name may itself hold dots.
+_VIRTUAL_HOSTED_S3 = re.compile(
+    r"^(?P<bucket>.+)\.s3(?:[.-](?:dualstack\.)?[a-z0-9-]+)?\.amazonaws\.com(?:\.cn)?$")
+
+
+def _s3_url_location(url):
+    """``(bucket, key)`` an S3 object URL names, or ``None``. The bucket is the
+    host's for a virtual-hosted address and the path's first segment for a
+    path-style one (the emulator's own endpoint included); the key is the rest
+    of the path, percent-decoded, since a key's reserved characters arrive
+    encoded (``app%3Av1.yml`` is the key ``app:v1.yml``)."""
+    parsed = urlparse(url)
+    path = parsed.path.lstrip("/")
+    virtual = _VIRTUAL_HOSTED_S3.match((parsed.hostname or "").lower())
+    if virtual:
+        bucket, key = virtual.group("bucket"), path
+    else:
+        bucket, _, key = path.partition("/")
+    if not bucket or not key:
+        return None
+    return bucket, unquote(key)
+
+
 def _resolve_document(params, body_key, url_key, label):
     """Resolve an inline document or its S3 URL (``TemplateBody``/``TemplateURL``,
     ``StackPolicyBody``/``StackPolicyURL``) to a string; ``label`` names the
@@ -242,16 +267,10 @@ def _resolve_document(params, body_key, url_key, label):
     if url:
         try:
             from ministack.services import s3 as _s3
-            parsed = urlparse(url)
-            # Support formats:
-            #   http://localhost:4566/bucket/key
-            #   https://s3.amazonaws.com/bucket/key
-            #   https://bucket.s3.amazonaws.com/key
-            path = parsed.path.lstrip("/")
-            parts = path.split("/", 1)
-            if len(parts) < 2:
+            location = _s3_url_location(url)
+            if location is None:
                 return None, _error("ValidationError", f"Invalid {url_key}: {url}")
-            bucket_name, key = parts[0], parts[1]
+            bucket_name, key = location
             obj_data = _s3._get_object_data(bucket_name, key)
             if obj_data is None:
                 return None, _error("ValidationError", f"{label} not found at {url}")
