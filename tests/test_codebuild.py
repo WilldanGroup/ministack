@@ -659,6 +659,72 @@ def test_the_build_service_reaches_the_host_by_name(monkeypatch, tmp_path):
         '  build:\n    extra_hosts:\n      - "host.docker.internal:host-gateway"\n')
 
 
+class _ComposeDaemon:
+    """The daemon an agent's docker-compose leaves resources on, each labelled
+    with its compose project the way compose labels them."""
+
+    class _Resource:
+        def __init__(self, daemon, kind, name, project):
+            self.daemon, self.kind, self.name = daemon, kind, name
+            self.labels = {"com.docker.compose.project": project}
+
+        def remove(self, **_kwargs):
+            self.daemon.resources.remove(self)
+
+    class _Collection:
+        def __init__(self, daemon, kind):
+            self.daemon, self.kind = daemon, kind
+
+        def list(self, all=False, filters=None):
+            key, _, value = filters["label"].partition("=")
+            return [r for r in self.daemon.resources
+                    if r.kind == self.kind and r.labels.get(key) == value]
+
+    def __init__(self, agent):
+        self.agent = agent
+        self.resources = []
+        self.containers = self._Collection(self, "container")
+        self.containers.run = self._run_agent
+        self.networks = self._Collection(self, "network")
+        self.volumes = self._Collection(self, "volume")
+
+    def compose_up(self, project):
+        for kind, name in (("container", f"{project}-agent-1"), ("container", f"{project}-build-1"),
+                           ("network", f"{project}_default"), ("volume", f"{project}_source_volume"),
+                           ("volume", f"{project}_user_volume")):
+            self.resources.append(self._Resource(self, kind, name, project))
+
+    def _run_agent(self, image, **kwargs):
+        self.compose_up(kwargs["environment"]["COMPOSE_PROJECT_NAME"])
+        return self.agent
+
+    def names(self):
+        return sorted(r.name for r in self.resources)
+
+
+def test_a_build_removes_its_compose_project_when_it_ends(monkeypatch, tmp_path):
+    """The agent brings its docker-compose project up and never takes it down.
+    The build runs it as a project of its own, and its end removes that
+    project's containers, network and volumes — and nothing of another build's."""
+    agent = _FakeContainer(["Phase complete: BUILD State: SUCCEEDED"])
+    docker = _ComposeDaemon(agent)
+    other = codebuild._compose_project("demo:0099")
+    docker.compose_up(other)
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: docker)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    project = _execution_project()
+    build = _seed_execution_build(project, "demo:0013")
+
+    codebuild._execute_build("demo:0013", project)
+
+    assert build["buildStatus"] == "SUCCEEDED"
+    assert agent.removed
+    assert docker.names() == sorted([
+        f"{other}-agent-1", f"{other}-build-1", f"{other}_default",
+        f"{other}_source_volume", f"{other}_user_volume",
+    ])
+
+
 def test_env_file_keeps_an_endpoint_the_project_declared(monkeypatch, tmp_path):
     monkeypatch.setattr(codebuild, "_aws_endpoint", lambda: "http://172.17.0.1:4566")
 
