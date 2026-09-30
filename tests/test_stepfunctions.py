@@ -8549,3 +8549,120 @@ def test_direct_secret_binary_sdk_keeps_arbitrary_bytes(sm):
         assert result["VersionId"] == updated["VersionId"]
     finally:
         sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+
+def test_sfn_aws_sdk_cloudformation_change_set_lifecycle(sfn_sync):
+    """A change set created, described by its id, executed with a request token
+    and the stack read back, all through aws-sdk:cloudformation — the calls a
+    deploy machine makes."""
+    import boto3
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack = f"sfn-cfn-{suffix}"
+    cfn = boto3.client("cloudformation", endpoint_url=sfn_sync.meta.endpoint_url, region_name="us-east-1",
+                       aws_access_key_id="test", aws_secret_access_key="test")
+    template = json.dumps({
+        "Parameters": {"Greeting": {"Type": "String"}},
+        "Resources": {"Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"}},
+        "Outputs": {"Greeting": {"Value": {"Ref": "Greeting"}}},
+    })
+    definition = json.dumps({
+        "StartAt": "Create",
+        "States": {
+            "Create": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:cloudformation:createChangeSet",
+                "Parameters": {
+                    "StackName": stack,
+                    "ChangeSetName": "first",
+                    "ChangeSetType": "CREATE",
+                    "TemplateBody": template,
+                    "Parameters": [{"ParameterKey": "Greeting", "ParameterValue": "hello"}],
+                    "Capabilities": ["CAPABILITY_IAM"],
+                    "Tags": [{"Key": "owner", "Value": "sfn"}],
+                },
+                "ResultSelector": {"changeSetId.$": "$.Id", "stackId.$": "$.StackId"},
+                "ResultPath": "$.changeSet",
+                "Next": "Describe",
+            },
+            "Describe": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:cloudformation:describeChangeSet",
+                "Parameters": {"ChangeSetName.$": "$.changeSet.changeSetId"},
+                "ResultPath": "$.described",
+                "Next": "Ready",
+            },
+            "Ready": {
+                "Type": "Choice",
+                "Choices": [{"Variable": "$.described.Status", "StringEquals": "CREATE_COMPLETE",
+                             "Next": "Execute"}],
+                "Default": "WaitChangeSet",
+            },
+            "WaitChangeSet": {"Type": "Wait", "Seconds": 1, "Next": "Describe"},
+            "Execute": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:cloudformation:executeChangeSet",
+                "Parameters": {"ChangeSetName.$": "$.changeSet.changeSetId", "ClientRequestToken": "swb-sfn-1"},
+                "ResultPath": None,
+                "Next": "DescribeStack",
+            },
+            "DescribeStack": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:cloudformation:describeStacks",
+                "Parameters": {"StackName.$": "$.changeSet.stackId"},
+                "ResultSelector": {"status.$": "$.Stacks[0].StackStatus", "outputs.$": "$.Stacks[0].Outputs",
+                                   "stack.$": "$.Stacks[0]"},
+                "ResultPath": "$.stack",
+                "Next": "Done",
+            },
+            "Done": {
+                "Type": "Choice",
+                "Choices": [{"Variable": "$.stack.status", "StringEquals": "CREATE_COMPLETE", "Next": "Succeeded"}],
+                "Default": "WaitStack",
+            },
+            "WaitStack": {"Type": "Wait", "Seconds": 1, "Next": "DescribeStack"},
+            "Succeeded": {"Type": "Succeed"},
+        },
+    })
+    sm_arn = sfn_sync.create_state_machine(
+        name=f"sfn-cfn-{suffix}", definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role")["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "SUCCEEDED", f"{resp.get('error')} — {resp.get('cause')}"
+        output = json.loads(resp["output"])
+
+        assert output["changeSet"]["changeSetId"].startswith("arn:aws:cloudformation:")
+        assert output["changeSet"]["stackId"] == output["stack"]["stack"]["StackId"]
+        assert output["described"]["ExecutionStatus"] == "AVAILABLE"
+        assert isinstance(output["described"]["Changes"], list)
+        assert [(o["OutputKey"], o["OutputValue"]) for o in output["stack"]["outputs"]] == [("Greeting", "hello")]
+        assert output["stack"]["stack"]["Capabilities"] == ["CAPABILITY_IAM"]
+        assert output["stack"]["stack"]["DisableRollback"] is False
+        events = cfn.describe_stack_events(StackName=stack)["StackEvents"]
+        assert {e.get("ClientRequestToken") for e in events if e["ResourceStatus"] != "REVIEW_IN_PROGRESS"} == {"swb-sfn-1"}
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        cfn.delete_stack(StackName=stack)
+
+
+def test_sfn_aws_sdk_cloudformation_error_is_prefixed(sfn_sync):
+    """A refusal surfaces as CloudFormation.<Code>, which a Retry or Catch names."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    definition = json.dumps({
+        "StartAt": "Describe",
+        "States": {"Describe": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:cloudformation:describeStacks",
+            "Parameters": {"StackName": f"no-such-stack-{suffix}"},
+            "End": True,
+        }},
+    })
+    sm_arn = sfn_sync.create_state_machine(
+        name=f"sfn-cfn-err-{suffix}", definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role")["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "FAILED"
+        assert resp["error"] == "CloudFormation.ValidationError", resp.get("cause")
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
