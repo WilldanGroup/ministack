@@ -2419,6 +2419,7 @@ async def _dispatch_service_request(
             agentcore_endpoint_arn,
             dynamodb_resource_arns,
             dynamodb_service_context,
+            dynamodb_transaction_checks,
             eventbridge_resource_arns,
             extract_iam_action,
             extract_resource_arn,
@@ -2441,10 +2442,26 @@ async def _dispatch_service_request(
                 service_context = kms_service_context(resource_arn)
             else:
                 service_context = None
-            denied = enforce(
-                access_key, iam_action, service, region,
-                resource_arn=resource_arn, service_context=service_context,
+            transaction = (
+                dynamodb_transaction_checks(iam_action, body, region, get_account_id())
+                if service == "dynamodb" else None
             )
+            if transaction is not None:
+                # Each item as the action it performs, on its own table.
+                denied = None
+                for item_action, item_arn in transaction:
+                    denied = enforce(
+                        access_key, item_action, service, region,
+                        resource_arn=item_arn, service_context=service_context,
+                    )
+                    if denied:
+                        iam_action = item_action
+                        break
+            else:
+                denied = enforce(
+                    access_key, iam_action, service, region,
+                    resource_arn=resource_arn, service_context=service_context,
+                )
             # A copy also reads its source, a batch delete is one check per
             # key, an attributes call is a pair, a governance bypass its own action.
             if service == "s3" and not denied:
