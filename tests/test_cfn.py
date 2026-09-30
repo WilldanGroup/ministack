@@ -8178,6 +8178,97 @@ def test_cfn_pipes_dynamodb_stream_to_sns(cfn, ddb, sqs):
     _wait_stack(cfn, stack_name)
 
 
+def _status_changes(sqs, queue_url, stack_ids, until, timeout=20):
+    """``(stack-id, status, client-request-token)`` for every Stack Status Change
+    the queue receives for ``stack_ids`` until ``until`` has arrived."""
+    got = []
+    deadline = time.time() + timeout
+    while time.time() < deadline and until not in {(i, s) for i, s, _t in got}:
+        for msg in sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10,
+                                       WaitTimeSeconds=1).get("Messages", []):
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+            event = json.loads(msg["Body"])
+            detail = event["detail"]
+            if detail["stack-id"] in stack_ids():
+                assert event["source"] == "aws.cloudformation"
+                assert event["resources"] == [detail["stack-id"]]
+                got.append((detail["stack-id"], detail["status-details"]["status"],
+                            detail["client-request-token"]))
+    return got
+
+
+def test_cfn_stack_status_changes_reach_the_default_bus_with_the_operation_token(cfn, s3, sqs, eb):
+    """Every status change of a stack and of its nested child is a Stack Status
+    Change on the default bus, carrying the token of the operation that caused
+    it — the create's, then the executed change set's."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    parent_name = f"cfn-status-{suffix}"
+    bucket = f"cfn-status-templates-{suffix}"
+    rule = f"cfn-status-{suffix}"
+    queue_url = sqs.create_queue(QueueName=f"cfn-status-{suffix}")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(Name=rule, EventPattern=json.dumps({
+        "source": ["aws.cloudformation"], "detail-type": ["CloudFormation Stack Status Change"]}))
+    eb.put_targets(Rule=rule, Targets=[{"Id": "q", "Arn": queue_arn}])
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="child.json", Body=json.dumps({
+        "Parameters": {"Version": {"Type": "String"}},
+        "Resources": {"Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"}},
+        "Outputs": {"Version": {"Value": {"Ref": "Version"}}},
+    }).encode())
+    parent_template = json.dumps({
+        "Parameters": {"Version": {"Type": "String"}},
+        "Resources": {"Nested": {"Type": "AWS::CloudFormation::Stack", "Properties": {
+            "TemplateURL": f"{cfn.meta.endpoint_url}/{bucket}/child.json",
+            "Parameters": {"Version": {"Ref": "Version"}},
+        }}},
+    })
+
+    def stack_ids():
+        return {stack["StackId"] for stack in _all_pages(cfn, "describe_stacks", "Stacks")
+                if stack["StackName"].startswith(parent_name)}
+
+    try:
+        parent_id = cfn.create_stack(
+            StackName=parent_name, TemplateBody=parent_template, ClientRequestToken="create-1",
+            Parameters=[{"ParameterKey": "Version", "ParameterValue": "1"}])["StackId"]
+        assert _wait_stack(cfn, parent_name)["StackStatus"] == "CREATE_COMPLETE"
+        created = _status_changes(sqs, queue_url, stack_ids, (parent_id, "CREATE_COMPLETE"))
+        child_id = next(i for i in stack_ids() if i != parent_id)
+
+        assert [(s, t) for i, s, t in created if i == parent_id] == [
+            ("CREATE_IN_PROGRESS", "create-1"), ("CREATE_COMPLETE", "create-1")]
+        assert [(s, t) for i, s, t in created if i == child_id] == [
+            ("CREATE_IN_PROGRESS", "create-1"), ("CREATE_COMPLETE", "create-1")]
+        events = cfn.describe_stack_events(StackName=parent_name)["StackEvents"]
+        assert {e.get("ClientRequestToken") for e in events} == {"create-1"}
+
+        cfn.create_change_set(
+            StackName=parent_name, ChangeSetName="v2", ChangeSetType="UPDATE",
+            TemplateBody=parent_template,
+            Parameters=[{"ParameterKey": "Version", "ParameterValue": "2"}])
+        deadline = time.time() + 20
+        while cfn.describe_change_set(StackName=parent_name, ChangeSetName="v2")["Status"] != "CREATE_COMPLETE":
+            assert time.time() < deadline, "the change set never became available"
+            time.sleep(0.5)
+        cfn.execute_change_set(StackName=parent_name, ChangeSetName="v2", ClientRequestToken="swb-deploy-2")
+        assert _wait_stack(cfn, parent_name)["StackStatus"] == "UPDATE_COMPLETE"
+        updated = _status_changes(sqs, queue_url, stack_ids, (parent_id, "UPDATE_COMPLETE"))
+
+        assert (parent_id, "UPDATE_COMPLETE", "swb-deploy-2") in updated
+        assert (child_id, "UPDATE_COMPLETE", "swb-deploy-2") in updated
+        assert {t for _i, _s, t in updated} == {"swb-deploy-2"}
+    finally:
+        cfn.delete_stack(StackName=parent_name)
+        _wait_stack(cfn, parent_name)
+        eb.remove_targets(Rule=rule, Ids=["q"])
+        eb.delete_rule(Name=rule)
+        sqs.delete_queue(QueueUrl=queue_url)
+        s3.delete_object(Bucket=bucket, Key="child.json")
+        s3.delete_bucket(Bucket=bucket)
+
+
 def _bus_pipe_template(stack_name, prefix):
     """A stream-enabled table, a bus whose rule sends to a queue, and a pipe from
     the table's stream to the bus admitting the rows whose sort key starts
