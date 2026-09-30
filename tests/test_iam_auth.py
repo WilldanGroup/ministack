@@ -4118,3 +4118,131 @@ def test_http_iam_routing_respects_auth_mode(monkeypatch, auth_enabled, ambiguou
     finally:
         for account in accounts:
             iam_svc._access_keys.pop_scoped(account, None, key, None)
+
+
+class TestDynamoDbTransactionAuthorization:
+    """A DynamoDB transaction is authorized item by item, each as the action it
+    performs on its own table — Put as dynamodb:PutItem, Update as UpdateItem,
+    Delete as DeleteItem, ConditionCheck as ConditionCheckItem, Get as GetItem
+    ("Using IAM with DynamoDB transactions"). There is no
+    dynamodb:TransactWriteItems action to grant, so a role granted the item
+    actions was refused every transaction before."""
+
+    _ACCOUNT = "000000000000"
+    _REGION = "us-east-1"
+    _ROLE = "ddb-transaction-probe"
+    _SESSION = "ASIADDBTRANSACTPROBE"
+
+    @staticmethod
+    def _dispatch(access_key, target, payload):
+        import ministack.app as app
+
+        headers = {
+            "host": "dynamodb.us-east-1.amazonaws.com",
+            "content-type": "application/x-amz-json-1.0",
+            "x-amz-target": f"DynamoDB_20120810.{target}",
+            "authorization": (
+                f"AWS4-HMAC-SHA256 Credential={access_key}/20260101/us-east-1/dynamodb"
+                "/aws4_request, SignedHeaders=host, Signature=deadbeef"
+            ),
+        }
+        return asyncio.run(app._dispatch_service_request(
+            "POST", "/", headers, json.dumps(payload).encode(), {}, "req-1"))
+
+    def _table_arn(self, name):
+        return f"arn:aws:dynamodb:{self._REGION}:{self._ACCOUNT}:table/{name}"
+
+    @pytest.fixture
+    def world(self, monkeypatch):
+        import types
+        import uuid
+
+        import ministack.app as app
+        from ministack.services import iam as iam_svc
+        from ministack.services import sts as sts_svc
+
+        monkeypatch.setattr(app, "AUTH", True)
+        tables = []
+
+        def table():
+            name = f"txn-probe-{uuid.uuid4().hex[:8]}"
+            status, _, body = self._dispatch("test", "CreateTable", {
+                "TableName": name,
+                "KeySchema": [{"AttributeName": "PK", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "PK", "AttributeType": "S"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            })
+            assert status == 200, body
+            tables.append(name)
+            return name
+
+        def role(statements):
+            iam_svc._roles[self._ROLE] = {
+                "RoleName": self._ROLE,
+                "Arn": f"arn:aws:iam::{self._ACCOUNT}:role/{self._ROLE}",
+                "RoleId": "AROADDBTRANSACTPROBE", "CreateDate": "2026-01-01", "Path": "/",
+                "AssumeRolePolicyDocument": "{}", "AttachedPolicies": [], "Tags": [],
+                "InlinePolicies": {"ddb": json.dumps({"Statement": statements})},
+            }
+            sts_svc.register_session(self._SESSION, {
+                "Arn": f"arn:aws:sts::{self._ACCOUNT}:assumed-role/{self._ROLE}/probe",
+                "UserId": "AROADDBTRANSACTPROBE:probe",
+                "SecretAccessKey": "s", "SessionToken": "t",
+                "Expiration": time.time() + 3600,
+                "AccountId": self._ACCOUNT, "PrincipalType": "AssumedRole",
+                "SourceAccessKeyId": "test",
+                "SourcePrincipalArn": f"arn:aws:iam::{self._ACCOUNT}:root",
+            })
+            return self._SESSION
+
+        try:
+            yield types.SimpleNamespace(table=table, role=role)
+        finally:
+            sts_svc._sessions.pop(self._SESSION, None)
+            iam_svc._roles.pop(self._ROLE, None)
+            for name in tables:
+                self._dispatch("test", "DeleteTable", {"TableName": name})
+
+    def test_a_write_transaction_needs_each_item_action_and_nothing_else(self, world):
+        a, b = world.table(), world.table()
+        session = world.role([
+            {"Effect": "Allow", "Action": ["dynamodb:PutItem", "dynamodb:ConditionCheckItem"],
+             "Resource": self._table_arn(a)},
+            {"Effect": "Allow", "Action": "dynamodb:UpdateItem", "Resource": self._table_arn(b)},
+        ])
+        status, _, body = self._dispatch(session, "TransactWriteItems", {"TransactItems": [
+            {"Put": {"TableName": a, "Item": {"PK": {"S": "one"}}}},
+            {"ConditionCheck": {"TableName": a, "Key": {"PK": {"S": "one-other"}},
+                                "ConditionExpression": "attribute_not_exists(PK)"}},
+            {"Update": {"TableName": b, "Key": {"PK": {"S": "two"}},
+                        "UpdateExpression": "SET v = :v",
+                        "ExpressionAttributeValues": {":v": {"S": "x"}}}},
+        ]})
+        assert status == 200, body
+
+    def test_an_item_whose_action_is_not_granted_refuses_the_transaction(self, world):
+        a, b = world.table(), world.table()
+        session = world.role([
+            {"Effect": "Allow", "Action": ["dynamodb:PutItem", "dynamodb:TransactWriteItems"],
+             "Resource": [self._table_arn(a), self._table_arn(b)]},
+        ])
+        status, _, body = self._dispatch(session, "TransactWriteItems", {"TransactItems": [
+            {"Put": {"TableName": a, "Item": {"PK": {"S": "one"}}}},
+            {"Delete": {"TableName": b, "Key": {"PK": {"S": "two"}}}},
+        ]})
+        assert status >= 400, body
+        assert b"AccessDeniedException" in body and b"dynamodb:DeleteItem" in body
+        status, _, body = self._dispatch("test", "GetItem", {"TableName": a, "Key": {"PK": {"S": "one"}}})
+        assert json.loads(body).get("Item") is None, "a refused transaction writes nothing"
+
+    def test_a_get_transaction_is_get_item_on_each_table(self, world):
+        a, b = world.table(), world.table()
+        session = world.role([
+            {"Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": self._table_arn(a)},
+        ])
+        request = {"TransactItems": [{"Get": {"TableName": a, "Key": {"PK": {"S": "one"}}}}]}
+        status, _, body = self._dispatch(session, "TransactGetItems", request)
+        assert status == 200, body
+        request["TransactItems"].append({"Get": {"TableName": b, "Key": {"PK": {"S": "two"}}}})
+        status, _, body = self._dispatch(session, "TransactGetItems", request)
+        assert b"AccessDeniedException" in body and b"dynamodb:GetItem" in body
