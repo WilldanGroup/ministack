@@ -747,3 +747,294 @@ def test_list_tags_unknown_arn_not_found(handler_env):
     status, _hdrs, b = _req("GET", f"/tags/{enc}")
     assert status == 404
     assert _body((status, _hdrs, b))["__type"] == "NotFoundException"
+
+
+# ---------------------------------------------------------------------------
+# FilterCriteria, enrichment and an event-bus target
+# ---------------------------------------------------------------------------
+
+_ACCOUNT = "000000000000"
+_REGION = "us-east-1"
+_PIPE_ARN = f"arn:aws:pipes:{_REGION}:{_ACCOUNT}:pipe/BusPipe"
+_BUS_ARN = f"arn:aws:events:{_REGION}:{_ACCOUNT}:event-bus/PipeBus"
+_ENRICHMENT_ARN = f"arn:aws:lambda:{_REGION}:{_ACCOUNT}:function:PipeEnrichment"
+
+
+def _stream_record(sk, event_id=None):
+    return {
+        "eventID": event_id or sk,
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "dynamodb": {"Keys": {"PK": {"S": "t#1"}, "SK": {"S": sk}}},
+    }
+
+
+_ROW_FILTER = {
+    "Filters": [
+        {"Pattern": json.dumps(
+            {"dynamodb": {"Keys": {"SK": {"S": [{"prefix": "deploy#"}, {"prefix": "instance#"}]}}}})},
+    ],
+}
+
+
+@pytest.fixture
+def bus_pipe_env():
+    """A running pipe in one account and region, reading a stream whose records
+    the test sets, with EventBridge's bus and rule stores clean around it."""
+    from ministack.services import eventbridge as _eb
+
+    _pipes.reset()
+    _ddb._stream_records.clear()
+    _eb.reset()
+    account_token = _request_account_id.set(_ACCOUNT)
+    region_token = _request_region.set(_REGION)
+
+    def make(records, **members):
+        _ddb._stream_records.set_scoped(_ACCOUNT, _REGION, "PipeTable", records)
+        pipe = {
+            "Name": "BusPipe",
+            "Arn": _PIPE_ARN,
+            "Source": _stream_arn(_REGION, "PipeTable"),
+            "Target": members.pop("Target", _BUS_ARN),
+            "CurrentState": "RUNNING",
+            "StartingPosition": "TRIM_HORIZON",
+        }
+        pipe.update(members)
+        _pipes._pipes["BusPipe"] = pipe
+        _pipes._positions[_PIPE_ARN] = 0
+        return pipe
+
+    try:
+        yield make
+    finally:
+        _request_region.reset(region_token)
+        _request_account_id.reset(account_token)
+        _pipes.reset()
+        _ddb._stream_records.clear()
+        _eb.reset()
+
+
+def _bus_with_rule(monkeypatch, pattern):
+    """The PipeBus bus with one rule; answers the list its matched events land in."""
+    from ministack.services import eventbridge as _eb
+
+    _eb._create_event_bus({"Name": "PipeBus"})
+    status, _h, body = _eb._put_rule({"Name": "Watch", "EventBusName": "PipeBus",
+                                      "EventPattern": json.dumps(pattern)})
+    assert status == 200, body
+    _eb._put_targets({"Rule": "Watch", "EventBusName": "PipeBus",
+                      "Targets": [{"Id": "t", "Arn": "arn:aws:sqs:us-east-1:000000000000:q"}]})
+    matched = []
+    monkeypatch.setattr(_eb, "_invoke_target", lambda target, event, rule, view=None: matched.append(event))
+    return matched
+
+
+def _enrichment(monkeypatch, answer):
+    """Stand the enrichment function in with ``answer(records) -> result``; the
+    result is what the Lambda executor returns for one invocation."""
+    from ministack.services import lambda_svc
+
+    calls = []
+    monkeypatch.setattr(lambda_svc, "_get_func_record_for_ref",
+                        lambda ref: ({"config": {}}, {"FunctionName": "PipeEnrichment"}, "PipeEnrichment")
+                        if ref == _ENRICHMENT_ARN else (None, None, ref))
+
+    def execute(record, event):
+        calls.append(event)
+        return answer(event)
+
+    monkeypatch.setattr(lambda_svc, "_execute_function_with_config_scope", execute)
+    return calls
+
+
+def test_pipes_filter_criteria_passes_only_the_records_a_pattern_admits(monkeypatch, bus_pipe_env):
+    from ministack.services import stepfunctions as _sfn
+
+    records = [_stream_record("deploy#1"), _stream_record("repo#a"),
+               _stream_record("instance#2"), _stream_record("build#b")]
+    bus_pipe_env(records, Target="arn:aws:states:us-east-1:000000000000:stateMachine:M",
+                 SourceParameters={"FilterCriteria": _ROW_FILTER})
+    started = []
+    monkeypatch.setattr(_sfn, "_start_execution",
+                        lambda data: (started.append(data), json_response({"executionArn": "x"}))[1])
+
+    _pipes._poll_once()
+
+    assert [r["eventID"] for r in json.loads(started[0]["input"])] == ["deploy#1", "instance#2"]
+    assert _pipes._positions[_PIPE_ARN] == 4, "records no pattern admits are consumed, not held"
+
+
+def test_pipes_batch_the_filter_empties_is_consumed_without_a_delivery(monkeypatch, bus_pipe_env):
+    matched = _bus_with_rule(monkeypatch, {"source": [{"exists": True}]})
+    calls = _enrichment(monkeypatch, lambda records: {"body": []})
+    bus_pipe_env([_stream_record("repo#a"), _stream_record("build#b")],
+                 SourceParameters={"FilterCriteria": _ROW_FILTER}, Enrichment=_ENRICHMENT_ARN)
+
+    _pipes._poll_once()
+
+    assert calls == [], "the enrichment is not invoked for a batch the filter emptied"
+    assert matched == []
+    assert _pipes._positions[_PIPE_ARN] == 2
+
+
+def test_pipes_enrichment_answer_is_put_on_the_bus_one_entry_per_event(monkeypatch, bus_pipe_env):
+    """The enrichment gets the filtered batch; each element it answers becomes
+    one PutEvents entry whose Source and DetailType are dynamic path parameters
+    and whose Detail is the rendered InputTemplate."""
+    from ministack.services import eventbridge as _eb
+
+    matched = _bus_with_rule(monkeypatch, {"source": ["app.control"], "detail-type": ["DeployRequested"]})
+
+    def forward(records):
+        return {"body": json.dumps([
+            {"Source": "app.control", "DetailType": "DeployRequested",
+             "Detail": json.dumps({"key": r["dynamodb"]["Keys"]["SK"]["S"]})}
+            for r in records
+        ])}
+
+    calls = _enrichment(monkeypatch, forward)
+    bus_pipe_env(
+        [_stream_record("deploy#1"), _stream_record("repo#a"), _stream_record("deploy#2")],
+        SourceParameters={"FilterCriteria": _ROW_FILTER},
+        Enrichment=_ENRICHMENT_ARN,
+        TargetParameters={
+            "EventBridgeEventBusParameters": {"Source": "$.Source", "DetailType": "$.DetailType"},
+            "InputTemplate": "<$.Detail>",
+        },
+    )
+
+    _pipes._poll_once()
+
+    assert [[r["eventID"] for r in batch] for batch in calls] == [["deploy#1", "deploy#2"]]
+    assert [json.loads(e["Detail"]) for e in matched] == [{"key": "deploy#1"}, {"key": "deploy#2"}]
+    assert {(e["Source"], e["DetailType"], e["EventBusName"]) for e in matched} == {
+        ("app.control", "DeployRequested", "PipeBus")}
+    assert len(_eb._events_log_list()) == 2, "the entries are put like any other PutEvents"
+    assert _pipes._positions[_PIPE_ARN] == 3
+
+
+def test_pipes_enrichment_empty_answer_delivers_nothing_and_consumes_the_batch(monkeypatch, bus_pipe_env):
+    matched = _bus_with_rule(monkeypatch, {"source": [{"exists": True}]})
+    _enrichment(monkeypatch, lambda records: {"body": "[]"})
+    bus_pipe_env([_stream_record("deploy#1")], Enrichment=_ENRICHMENT_ARN)
+
+    _pipes._poll_once()
+
+    assert matched == []
+    assert _pipes._positions[_PIPE_ARN] == 1
+
+
+def test_pipes_failed_enrichment_holds_the_batch(monkeypatch, bus_pipe_env, caplog):
+    matched = _bus_with_rule(monkeypatch, {"source": [{"exists": True}]})
+    _enrichment(monkeypatch, lambda records: {"error": True, "body": {"errorType": "Error"}})
+    bus_pipe_env([_stream_record("deploy#1")], Enrichment=_ENRICHMENT_ARN)
+
+    with caplog.at_level("WARNING"):
+        _pipes._poll_once()
+
+    assert matched == []
+    assert _pipes._positions[_PIPE_ARN] == 0
+    assert "enrichment PipeEnrichment failed" in caplog.text
+
+
+def test_pipes_object_spliced_by_the_template_is_malformed_detail_and_holds(monkeypatch, bus_pipe_env, caplog):
+    """A template with no quotes splices an object with its quotes dropped, which
+    is not JSON; PutEvents would refuse it as MalformedDetail, so no entry of
+    the batch is put."""
+    from ministack.services import eventbridge as _eb
+
+    _bus_with_rule(monkeypatch, {"source": [{"exists": True}]})
+    _enrichment(monkeypatch, lambda records: {"body": [
+        {"Source": "s", "DetailType": "d", "Detail": "{\"ok\": true}"},
+        {"Source": "s", "DetailType": "d", "Detail": {"not": "text"}},
+    ]})
+    bus_pipe_env([_stream_record("deploy#1")], Enrichment=_ENRICHMENT_ARN, TargetParameters={
+        "EventBridgeEventBusParameters": {"Source": "$.Source", "DetailType": "$.DetailType"},
+        "InputTemplate": "<$.Detail>",
+    })
+
+    with caplog.at_level("WARNING"):
+        _pipes._poll_once()
+
+    assert "MalformedDetail" in caplog.text
+    assert _eb._events_log_list() == []
+    assert _pipes._positions[_PIPE_ARN] == 0
+
+
+def test_pipes_dynamic_path_that_does_not_resolve_holds_the_batch(monkeypatch, bus_pipe_env, caplog):
+    from ministack.services import eventbridge as _eb
+
+    _bus_with_rule(monkeypatch, {"source": [{"exists": True}]})
+    bus_pipe_env([_stream_record("deploy#1")], TargetParameters={
+        "EventBridgeEventBusParameters": {"Source": "$.Source", "DetailType": "Fixed"},
+    })
+
+    with caplog.at_level("WARNING"):
+        _pipes._poll_once()
+
+    assert "does not resolve" in caplog.text
+    assert _eb._events_log_list() == []
+    assert _pipes._positions[_PIPE_ARN] == 0
+
+
+def test_pipes_without_an_input_template_puts_the_event_itself_as_detail(monkeypatch, bus_pipe_env):
+    matched = _bus_with_rule(monkeypatch, {"source": ["fixed.source"]})
+    record = _stream_record("deploy#1")
+    bus_pipe_env([record], TargetParameters={
+        "EventBridgeEventBusParameters": {"Source": "fixed.source", "DetailType": "Row"},
+    })
+
+    _pipes._poll_once()
+
+    assert [json.loads(e["Detail"]) for e in matched] == [record]
+
+
+def test_pipes_batch_size_caps_each_delivery(monkeypatch, bus_pipe_env):
+    from ministack.services import stepfunctions as _sfn
+
+    bus_pipe_env([_stream_record(f"deploy#{i}") for i in range(5)],
+                 Target="arn:aws:states:us-east-1:000000000000:stateMachine:M",
+                 SourceParameters={"DynamoDBStreamParameters": {"BatchSize": 2}})
+    started = []
+    monkeypatch.setattr(_sfn, "_start_execution",
+                        lambda data: (started.append(data), json_response({"executionArn": "x"}))[1])
+
+    for _ in range(3):
+        _pipes._poll_once()
+
+    assert [len(json.loads(s["input"])) for s in started] == [2, 2, 1]
+    assert _pipes._positions[_PIPE_ARN] == 5
+
+
+def test_create_pipe_keeps_and_describes_its_parameters(handler_env):
+    members = {
+        "SourceParameters": {"FilterCriteria": _ROW_FILTER,
+                             "DynamoDBStreamParameters": {"StartingPosition": "LATEST", "BatchSize": 10}},
+        "Enrichment": _ENRICHMENT_ARN,
+        "TargetParameters": {"EventBridgeEventBusParameters": {"Source": "$.Source", "DetailType": "$.DetailType"},
+                             "InputTemplate": "<$.Detail>"},
+    }
+    assert _create("Described", Target=_BUS_ARN, **members)[0] == 200
+
+    described = _body(_req("GET", "/v1/pipes/Described"))
+    for member, value in members.items():
+        assert described[member] == value
+
+
+def test_create_pipe_refuses_a_filter_pattern_eventbridge_would_refuse(handler_env):
+    resp = _create("BadFilter", SourceParameters={"FilterCriteria": {"Filters": [{"Pattern": "{not json"}]}})
+    assert resp[0] == 400
+    assert _body(resp)["__type"] == "ValidationException"
+    assert _pipes._pipes.get("BadFilter") is None
+
+
+def test_update_pipe_replaces_its_filter_and_keeps_its_position(handler_env):
+    _create("Updated", SourceParameters={"FilterCriteria": _ROW_FILTER})
+    pipe = _pipes._pipes["Updated"]
+    _pipes._positions[pipe["Arn"]] = 7
+    wider = {"Filters": [{"Pattern": json.dumps({"dynamodb": {"Keys": {"SK": {"S": [{"prefix": "c"}]}}}})}]}
+
+    assert _req("PUT", "/v1/pipes/Updated", {"SourceParameters": {"FilterCriteria": wider}})[0] == 200
+
+    assert _pipes._pipes["Updated"]["SourceParameters"]["FilterCriteria"] == wider
+    assert _pipes._positions[pipe["Arn"]] == 7

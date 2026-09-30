@@ -8178,6 +8178,113 @@ def test_cfn_pipes_dynamodb_stream_to_sns(cfn, ddb, sqs):
     _wait_stack(cfn, stack_name)
 
 
+def _bus_pipe_template(stack_name, prefix):
+    """A stream-enabled table, a bus whose rule sends to a queue, and a pipe from
+    the table's stream to the bus admitting the rows whose sort key starts
+    with ``prefix``."""
+    return {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "PipeTable": {
+                "Type": "AWS::DynamoDB::Table",
+                "Properties": {
+                    "TableName": f"{stack_name}-table",
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"},
+                                  {"AttributeName": "sk", "KeyType": "RANGE"}],
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"},
+                                             {"AttributeName": "sk", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST",
+                    "StreamSpecification": {"StreamViewType": "NEW_AND_OLD_IMAGES"},
+                },
+            },
+            "PipeBus": {"Type": "AWS::Events::EventBus", "Properties": {"Name": f"{stack_name}-bus"}},
+            "PipeQueue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": f"{stack_name}-q"}},
+            "PipeQueuePolicy": {
+                "Type": "AWS::SQS::QueuePolicy",
+                "Properties": {
+                    "Queues": [{"Ref": "PipeQueue"}],
+                    "PolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Effect": "Allow",
+                            "Principal": {"Service": "events.amazonaws.com"},
+                            "Action": "sqs:SendMessage",
+                            "Resource": {"Fn::GetAtt": ["PipeQueue", "Arn"]},
+                        }],
+                    },
+                },
+            },
+            "RowRule": {
+                "Type": "AWS::Events::Rule",
+                "Properties": {
+                    "EventBusName": {"Ref": "PipeBus"},
+                    "EventPattern": {"source": ["app.rows"]},
+                    "Targets": [{"Id": "q", "Arn": {"Fn::GetAtt": ["PipeQueue", "Arn"]}}],
+                },
+            },
+            "RowPipe": {
+                "Type": "AWS::Pipes::Pipe",
+                "Properties": {
+                    "RoleArn": "arn:aws:iam::000000000000:role/test-pipe-role",
+                    "Source": {"Fn::GetAtt": ["PipeTable", "StreamArn"]},
+                    "Target": {"Fn::GetAtt": ["PipeBus", "Arn"]},
+                    "SourceParameters": {
+                        "DynamoDBStreamParameters": {"StartingPosition": "LATEST", "BatchSize": 10},
+                        "FilterCriteria": {"Filters": [{"Pattern": json.dumps(
+                            {"dynamodb": {"Keys": {"sk": {"S": [{"prefix": prefix}]}}}})}]},
+                    },
+                    "TargetParameters": {
+                        "EventBridgeEventBusParameters": {"Source": "app.rows", "DetailType": "$.eventName"},
+                        "InputTemplate": '{"key": <$.dynamodb.Keys.sk.S>}',
+                    },
+                },
+            },
+        },
+    }
+
+
+def _drain_details(sqs, queue_url, want, timeout=10):
+    """The (detail-type, detail) of every event the queue receives until ``want``
+    have arrived or ``timeout`` passes."""
+    got = []
+    deadline = time.time() + timeout
+    while time.time() < deadline and len(got) < want:
+        for msg in sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10,
+                                       WaitTimeSeconds=1).get("Messages", []):
+            event = json.loads(msg["Body"])
+            got.append((event["detail-type"], event["detail"]))
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+    return got
+
+
+def test_cfn_pipes_filter_to_event_bus_and_update_in_place(cfn, ddb, sqs):
+    """A stack's pipe puts the rows its filter admits on its bus, one event per
+    record, and an update of the filter keeps the pipe on its stream."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-pipe-bus-{uid}"
+    table_name = f"{stack_name}-table"
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_bus_pipe_template(stack_name, "deploy#")))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    queue_url = sqs.get_queue_url(QueueName=f"{stack_name}-q")["QueueUrl"]
+    try:
+        ddb.put_item(TableName=table_name, Item={"pk": {"S": "t"}, "sk": {"S": "repo#a"}})
+        ddb.put_item(TableName=table_name, Item={"pk": {"S": "t"}, "sk": {"S": "deploy#1"}})
+        assert _drain_details(sqs, queue_url, 2, timeout=6) == [("INSERT", {"key": "deploy#1"})]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_bus_pipe_template(stack_name, "repo#")))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+
+        ddb.put_item(TableName=table_name, Item={"pk": {"S": "t"}, "sk": {"S": "deploy#2"}})
+        ddb.put_item(TableName=table_name, Item={"pk": {"S": "t"}, "sk": {"S": "repo#b"}})
+        assert _drain_details(sqs, queue_url, 2, timeout=6) == [("INSERT", {"key": "repo#b"})]
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
 def test_cfn_pipes_rejects_cross_region_target(cfn):
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-pipe-xreg-{uid}"
