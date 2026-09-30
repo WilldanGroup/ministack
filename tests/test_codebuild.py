@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import time
 
 import boto3
@@ -362,6 +363,40 @@ def test_start_build_is_metadata_only_by_default(monkeypatch):
     assert status == 200
     assert json.loads(body)["build"]["buildStatus"] == "SUCCEEDED"
     assert calls == []
+
+
+def test_start_build_overrides_reach_the_build(monkeypatch):
+    """environmentVariablesOverride replaces a declared variable and adds a new
+    one, for this build only: the record reads them and the executed build is
+    handed them, while the project keeps its declared values."""
+    started = threading.Event()
+    executed = []
+
+    def _capture(build_id, project):
+        executed.append(project)
+        started.set()
+
+    monkeypatch.setattr(codebuild, "EXECUTE_BUILDS", True)
+    monkeypatch.setattr(codebuild, "_execute_build", _capture)
+    codebuild._projects["demo"] = _execution_project()
+
+    status, _headers, body = codebuild._start_build({
+        "projectName": "demo",
+        "environmentVariablesOverride": [
+            {"name": "FOO", "value": "overridden", "type": "PLAINTEXT"},
+            {"name": "EXTRA", "value": "added", "type": "PLAINTEXT"},
+        ],
+    })
+
+    assert status == 200
+    expected = {"FOO": "overridden", "EXTRA": "added"}
+    recorded = json.loads(body)["build"]["environment"]["environmentVariables"]
+    assert {v["name"]: v["value"] for v in recorded} == expected
+    assert started.wait(5)
+    handed = executed[0]["environment"]["environmentVariables"]
+    assert {v["name"]: v["value"] for v in handed} == expected
+    declared = codebuild._projects["demo"]["environment"]["environmentVariables"]
+    assert declared == [{"name": "FOO", "value": "bar"}]
 
 
 def test_execute_build_records_phases_from_agent_log(monkeypatch, tmp_path):
