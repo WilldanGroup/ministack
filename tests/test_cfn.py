@@ -8178,6 +8178,58 @@ def test_cfn_pipes_dynamodb_stream_to_sns(cfn, ddb, sqs):
     _wait_stack(cfn, stack_name)
 
 
+def test_cfn_global_table_update_keeps_the_table_and_its_items(cfn, ddb):
+    """An auto-named GlobalTable updated in place — a GSI added — keeps its
+    physical id and every item. Before, the update derived the table's name
+    from the physical id rather than the logical id, the name differed, and the
+    table was replaced empty."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-gt-update-{suffix}"
+
+    def template(with_index):
+        table = {
+            "Type": "AWS::DynamoDB::GlobalTable",
+            "Properties": {
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"},
+                                         {"AttributeName": "g", "AttributeType": "S"}],
+                "BillingMode": "PAY_PER_REQUEST",
+                "StreamSpecification": {"StreamViewType": "NEW_AND_OLD_IMAGES"},
+                "Replicas": [{"Region": "us-east-1"}],
+            },
+        }
+        if with_index:
+            table["Properties"]["GlobalSecondaryIndexes"] = [{
+                "IndexName": "byG",
+                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }]
+        return json.dumps({"Resources": {"Rows": table},
+                           "Outputs": {"Name": {"Value": {"Ref": "Rows"}}}})
+
+    def name():
+        stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+        return {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["Name"]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(False))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        before = name()
+        ddb.put_item(TableName=before, Item={"pk": {"S": "kept"}, "g": {"S": "x"}})
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+
+        assert name() == before
+        assert ddb.get_item(TableName=before, Key={"pk": {"S": "kept"}}).get("Item") is not None
+        indexes = ddb.describe_table(TableName=before)["Table"].get("GlobalSecondaryIndexes", [])
+        assert [i["IndexName"] for i in indexes] == ["byG"]
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
 def test_cfn_template_url_virtual_hosted_with_an_encoded_key(cfn, s3):
     """A TemplateURL in the virtual-hosted form names its bucket in the host,
     and its key arrives percent-encoded; both resolve, for the stack and for a
