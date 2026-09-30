@@ -8178,6 +8178,39 @@ def test_cfn_pipes_dynamodb_stream_to_sns(cfn, ddb, sqs):
     _wait_stack(cfn, stack_name)
 
 
+def test_cfn_template_url_virtual_hosted_with_an_encoded_key(cfn, s3):
+    """A TemplateURL in the virtual-hosted form names its bucket in the host,
+    and its key arrives percent-encoded; both resolve, for the stack and for a
+    nested child addressed the same way."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket = f"cfn-vhost-{suffix}"
+    stack_name = f"cfn-vhost-{suffix}"
+    child_key = "templates/child:v1.json"
+    parent_key = "templates/parent:v1.json"
+    host = f"https://{bucket}.s3.us-east-1.amazonaws.com"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key=child_key, Body=json.dumps({
+        "Resources": {"Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"}},
+        "Outputs": {"Where": {"Value": "child"}},
+    }).encode())
+    s3.put_object(Bucket=bucket, Key=parent_key, Body=json.dumps({
+        "Resources": {"Nested": {"Type": "AWS::CloudFormation::Stack", "Properties": {
+            "TemplateURL": f"{host}/templates/child%3Av1.json"}}},
+        "Outputs": {"Where": {"Value": {"Fn::GetAtt": ["Nested", "Outputs.Where"]}}},
+    }).encode())
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateURL=f"{host}/templates/parent%3Av1.json")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]} == {"Where": "child"}
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        for key in (child_key, parent_key):
+            s3.delete_object(Bucket=bucket, Key=key)
+        s3.delete_bucket(Bucket=bucket)
+
+
 def _status_changes(sqs, queue_url, stack_ids, until, timeout=20):
     """``(stack-id, status, client-request-token)`` for every Stack Status Change
     the queue receives for ``stack_ids`` until ``until`` has arrived."""
