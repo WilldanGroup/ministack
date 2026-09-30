@@ -4192,6 +4192,9 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
     provisioned: dict = child_stack["_resources"]
     prev_resources = (previous_stack_snapshot.get("_resources", {})
                       if previous_stack_snapshot else {})
+    # (logical id, type, predecessor's physical id, its properties, whether
+    # the template retains it) of each resource this update replaced.
+    replaced = []
 
     for child_logical_id in ordered:
         res_def = resources_defs[child_logical_id]
@@ -4230,8 +4233,9 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                     res_def, "UpdateReplacePolicy", provisioned, param_values,
                     conditions, mappings, child_name, child_stack_id,
                 ) in _RETAINING_POLICIES)
-                # The child has no cleanup phase of its own: its handlers
-                # delete the predecessor at once, not into the parent's queue.
+                # Its handlers delete the predecessor at once, not into the
+                # parent's queue; a replacement whose handler leaves the
+                # predecessor standing is cleaned up below.
                 deferred_token = _DEFERRED_PREDECESSOR_DELETES.set(None)
                 try:
                     # The attributes the resource answered last time travel
@@ -4242,9 +4246,14 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                         old_tagged, new_tagged, child_name, child_logical_id,
                         prev.get("Attributes", {}),
                     )
+                    retained = _RETAIN_REPLACED.get()
                 finally:
                     _DEFERRED_PREDECESSOR_DELETES.reset(deferred_token)
                     _RETAIN_REPLACED.reset(token)
+                old_pid = prev.get("PhysicalResourceId", child_logical_id)
+                if physical_id != old_pid:
+                    replaced.append((child_logical_id, resource_type, old_pid,
+                                     prev.get("Properties", {}), retained))
             else:
                 physical_id, attrs = _provision_resource(
                     resource_type, child_logical_id, new_tagged, child_name,
@@ -4283,6 +4292,25 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         }
         _add_event(child_stack_id, child_name, child_logical_id, resource_type,
                    f"{status_prefix}_COMPLETE", physical_id=physical_id)
+
+    # Replacement cleanup, as the top-level stack runs it: once every resource
+    # of the child stands, each replaced resource's predecessor is deleted,
+    # dependents first, unless the template retains it. Without it a handler
+    # that creates the replacement under a new physical id (an event bus
+    # given a new Name) left the predecessor standing, and a rollback that
+    # sent the child back to its old template collided with it.
+    for (replaced_id, rtype, old_pid, old_props, retained) in reversed(replaced):
+        if retained:
+            _add_event(child_stack_id, child_name, replaced_id, rtype,
+                       "DELETE_SKIPPED", physical_id=old_pid)
+            continue
+        try:
+            _delete_resource(rtype, old_pid, old_props, child_name, replaced_id)
+        except Exception as exc:
+            logger.error("Nested-stack %s: failed to delete replaced %s (%s): %s",
+                         child_name, replaced_id, old_pid, exc)
+            _add_event(child_stack_id, child_name, replaced_id, rtype,
+                       "DELETE_FAILED", str(exc), old_pid)
 
     if is_update:
         snapshot = previous_stack_snapshot or {}
