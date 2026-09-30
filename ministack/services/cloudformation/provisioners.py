@@ -1895,15 +1895,19 @@ def _ddb_global_table_create(logical_id, props, stack_name):
     LSIs, `StreamSpecification`, `SSESpecification`, `TimeToLiveSpecification`,
     `TableName`) routes through the regular Table provisioner.
     """
-    translated = dict(props)
-    translated.pop("Replicas", None)
-    translated.pop("MultiRegionConsistency", None)
-    translated.pop("GlobalTableWitnesses", None)
-    translated.pop("GlobalTableSourceArn", None)
-    translated.pop("WarmThroughput", None)
-    translated.pop("WriteOnDemandThroughputSettings", None)
-    translated.pop("ReadOnDemandThroughputSettings", None)
+    return _ddb_create(logical_id, _global_table_as_table(props), stack_name)
 
+
+def _global_table_as_table(props):
+    """A GlobalTable's properties in the Table provisioner's shape: the
+    multi-region settings dropped, and the write and read autoscaling minimums
+    as ProvisionedThroughput."""
+    translated = dict(props)
+    for prop in ("Replicas", "MultiRegionConsistency", "GlobalTableWitnesses",
+                 "GlobalTableSourceArn", "WarmThroughput",
+                 "WriteOnDemandThroughputSettings", "ReadOnDemandThroughputSettings",
+                 "WriteProvisionedThroughputSettings", "ReadProvisionedThroughputSettings"):
+        translated.pop(prop, None)
     write = (props.get("WriteProvisionedThroughputSettings") or {})
     read = (props.get("ReadProvisionedThroughputSettings") or {})
     write_cap = (write.get("WriteCapacityAutoScalingSettings") or {}).get("MinCapacity")
@@ -1913,10 +1917,7 @@ def _ddb_global_table_create(logical_id, props, stack_name):
             "WriteCapacityUnits": int(write_cap) if write_cap is not None else 5,
             "ReadCapacityUnits": int(read_cap) if read_cap is not None else 5,
         }
-    translated.pop("WriteProvisionedThroughputSettings", None)
-    translated.pop("ReadProvisionedThroughputSettings", None)
-
-    return _ddb_create(logical_id, translated, stack_name)
+    return translated
 
 
 def _ddb_global_table_delete(physical_id, props):
@@ -12316,16 +12317,18 @@ def _ecr_repo_update(physical_id, old_props, new_props, stack_name):
     return physical_id, {"Arn": repo["repositoryArn"], "RepositoryUri": repo["repositoryUri"]}
 
 
-def _ddb_global_table_update(physical_id, old_props, new_props, stack_name):
-    # Same property translation as create, then the Table update handler —
-    # the create-fallback rebuilt the table record and dropped every item.
-    translated = dict(new_props)
-    for prop in ("Replicas", "MultiRegionConsistency", "GlobalTableWitnesses",
-                 "GlobalTableSourceArn", "WarmThroughput",
-                 "WriteOnDemandThroughputSettings", "ReadOnDemandThroughputSettings",
-                 "WriteProvisionedThroughputSettings", "ReadProvisionedThroughputSettings"):
-        translated.pop(prop, None)
-    return _ddb_update(physical_id, old_props, translated, stack_name)
+def _ddb_global_table_update(physical_id, old_props, new_props, stack_name, logical_id):
+    # The translation create applies, to both sides, then the Table update
+    # handler with the logical id: an auto-named table's name is derived from
+    # it, and without it the name came out different, so every update of a
+    # stack replaced the table and dropped every item.
+    return _ddb_update(
+        physical_id,
+        _global_table_as_table(old_props),
+        _global_table_as_table(new_props),
+        stack_name,
+        logical_id,
+    )
 
 
 def _eb_event_bus_update(physical_id, old_props, new_props, stack_name):
@@ -12670,7 +12673,12 @@ _RESOURCE_HANDLERS = {
     # comes from WriteProvisionedThroughputSettings; Replicas is required and
     # ignored locally), so it gets a dedicated provisioner that translates
     # before delegating to the Table engine.
-    "AWS::DynamoDB::GlobalTable": {"create": _ddb_global_table_create, "update": _ddb_global_table_update, "delete": _ddb_global_table_delete},
+    "AWS::DynamoDB::GlobalTable": {
+        "create": _ddb_global_table_create,
+        "update": _ddb_global_table_update,
+        "update_with_logical_id": True,
+        "delete": _ddb_global_table_delete,
+    },
     "AWS::Lambda::Function": {
         "create": _lambda_create,
         "update": _lambda_update,
