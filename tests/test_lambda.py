@@ -7595,12 +7595,8 @@ def test_lambda_invoke_emits_cloudwatch_logs_nodejs(lam, logs):
 
 
 def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags="", config_overrides=None):
-    """Spawn one Lambda container against fakes and return the docker kwargs.
-
-    Captures both entry points: the DinD path uses ``containers.create`` (code
-    is docker-cp'd rather than bind-mounted) and everything else uses
-    ``containers.run``, and which one a runner takes is not this test's point.
-    """
+    """Spawn one Lambda container against fakes and return the kwargs it was
+    created with."""
     monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", docker_flags)
     monkeypatch.setattr(lsvc, "_docker_available", True)
     monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint)
@@ -7614,7 +7610,6 @@ def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags="", config_
         return fake_container
 
     fake_client = MagicMock()
-    fake_client.containers.run = _capture
     fake_client.containers.create = _capture
     fake_client.images.get = MagicMock()
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
@@ -7727,7 +7722,7 @@ def test_lambda_container_without_host_docker_internal_gets_no_mapping(monkeypat
 # ──────────────────── LAMBDA_DOCKER_FLAGS ────────────────────
 
 def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
-    """LAMBDA_DOCKER_FLAGS env/volume/dns/network/cap/memory flags end up in containers.run() kwargs."""
+    """LAMBDA_DOCKER_FLAGS env/volume/dns/network/cap/memory flags end up in the container's kwargs."""
     monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", (
         '-v /host/ca:/opt/ca:ro -e SSL_CERT_FILE=/opt/ca/ca.crt -e NODE_EXTRA_CA_CERTS=/opt/ca/ca.crt '
         '--dns 172.30.0.2 --network=my-net --memory 512m --shm-size=256m '
@@ -7744,9 +7739,6 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
         return fake_container
 
     fake_client = MagicMock()
-    fake_client.containers.run = _fake_run
-    # A runner that is itself containerised takes the docker-cp path, which
-    # calls containers.create; the flags land in the same kwargs either way.
     fake_client.containers.create = _fake_run
     fake_client.images.get = MagicMock()
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
@@ -12434,6 +12426,66 @@ def test_spawn_failure_after_extraction_keeps_the_cache(monkeypatch, tmp_path):
     assert len(extractions) == 1, "second cold start must reuse the cached tree"
     (key,) = lsvc._docker_extract_dirs
     assert key.startswith("code-") and os.path.isdir(lsvc._docker_extract_dirs[key])
+
+
+class _StartTimesOut:
+    """A created container whose start the daemon never answers in time."""
+
+    id = "cid-start-times-out"
+    status = "created"
+
+    def __init__(self):
+        self.removed = False
+
+    def start(self):
+        raise TimeoutError("UnixHTTPConnectionPool(host='localhost', port=None): Read timed out.")
+
+    def remove(self, force=False, v=False):
+        self.removed = True
+
+
+def test_spawn_removes_a_container_whose_start_fails(monkeypatch, tmp_path):
+    """A start that times out leaves the container created; the spawn removes
+    it before the error reaches the invoke, whichever path created it."""
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", "")
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    code = _make_zip("def handler(e, c): pass")
+
+    for in_container in (False, True):
+        monkeypatch.setattr(lsvc, "_running_in_container", lambda: in_container)
+        monkeypatch.setattr(lsvc, "_docker_cp_dir", lambda *args, **kwargs: None)
+        container = _StartTimesOut()
+        fake_client = MagicMock()
+        fake_client.containers.create.return_value = container
+        # docker-py's run(): create, then start, returning nothing if start raises.
+        fake_client.containers.run.side_effect = (
+            lambda **kwargs: fake_client.containers.create(**kwargs).start())
+        monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
+
+        with pytest.raises(TimeoutError):
+            lsvc._spawn_lambda_container(dict(_SPAWN_LEAK_CONFIG), code)
+
+        assert container.removed
+
+
+def test_reaper_reclaims_a_lambda_container_the_pool_no_longer_holds(fake_docker, monkeypatch):
+    """A function container that is not running and that the warm pool does not
+    hold — a failed start that could not be removed, one pruned after dying —
+    is reclaimed; one the pool still holds is kept."""
+    from ministack.core import container_reaper
+
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    held = fake_docker.containers.run(name="held", labels=container_reaper.own_labels("lambda"))
+    held.status = "exited"
+    stray = fake_docker.containers.run(name="stray", labels=container_reaper.own_labels("lambda"))
+    stray.status = "created"
+    monkeypatch.setattr(lsvc, "_warm_pool", {"000000000000:us-east-1:fn:zip:sha": [
+        {"container": held, "tmpdir": None, "in_use": False, "last_used": 0, "created": 0},
+    ]})
+
+    assert container_reaper.reap_abandoned(fake_docker) == 1
+    assert fake_docker.live() == ["held"]
 
 
 def test_docker_extracted_dir_is_content_addressed(monkeypatch, tmp_path):
