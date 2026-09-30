@@ -15088,6 +15088,170 @@ def test_cfn_nested_stack_update_keeps_an_unchanged_custom_resources_data(cfn, s
         lam.delete_function(FunctionName=fn_name)
 
 
+def _nested_export_world(s3, suffix):
+    """A templates bucket holding a child that exports its marker parameter's
+    name under the name its ``ExportName`` parameter gives (``exporting.json``)
+    and the same child without the ``Export`` (``plain.json``); a parent that
+    nests the child from either key; and a stack that imports the name."""
+    bucket = f"cfn-nested-export-{suffix}"
+    export_name = f"cfn-nested-export-{suffix}-Marker"
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    s3.create_bucket(Bucket=bucket)
+
+    def child(exported):
+        output = {"Value": {"Ref": "Marker"}}
+        if exported:
+            # Resolved in the child's scope: the name is one of its parameters.
+            output["Export"] = {"Name": {"Ref": "ExportName"}}
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Parameters": {"ExportName": {"Type": "String"}},
+            "Resources": {"Marker": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn-nested-export-{suffix}/marker",
+                "Type": "String", "Value": "one"}}},
+            "Outputs": {"Marker": output},
+        }
+
+    s3.put_object(Bucket=bucket, Key="exporting.json",
+                  Body=json.dumps(child(exported=True)).encode())
+    s3.put_object(Bucket=bucket, Key="plain.json",
+                  Body=json.dumps(child(exported=False)).encode())
+
+    def parent(key):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"Child": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": f"{endpoint}/{bucket}/{key}",
+                               "Parameters": {"ExportName": export_name}},
+            }},
+        })
+
+    importer = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Imported": {"Type": "AWS::SSM::Parameter", "Properties": {
+            "Name": f"/cfn-nested-export-{suffix}/imported",
+            "Type": "String", "Value": {"Fn::ImportValue": export_name}}}},
+    })
+
+    def remove():
+        for key in ("exporting.json", "plain.json"):
+            s3.delete_object(Bucket=bucket, Key=key)
+        s3.delete_bucket(Bucket=bucket)
+
+    return export_name, parent, importer, remove
+
+
+def test_cfn_nested_stack_export_is_recorded_imported_and_released_with_its_parent(cfn, s3, ssm):
+    """A nested child's exported output is recorded as a root stack's is: the
+    child's output carries its ExportName, ListExports lists it with the
+    child's StackId, another stack's Fn::ImportValue of it resolves in a
+    resource property, and deleting the nesting stack releases it. The child's
+    outputs used to be resolved without their Export, so the name was never
+    recorded and the importer failed "Export ... not found"."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    parent_name = f"cfn-nested-export-{suffix}"
+    importer_name = f"cfn-nested-import-{suffix}"
+    export_name, parent, importer, remove = _nested_export_world(s3, suffix)
+    marker = f"/cfn-nested-export-{suffix}/marker"
+    try:
+        cfn.create_stack(StackName=parent_name, TemplateBody=parent("exporting.json"))
+        stack = _wait_stack(cfn, parent_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, parent_name)
+        child_id = cfn.describe_stack_resource(StackName=parent_name, LogicalResourceId="Child")[
+            "StackResourceDetail"]["PhysicalResourceId"]
+        [output] = cfn.describe_stacks(StackName=child_id)["Stacks"][0]["Outputs"]
+        assert output["OutputValue"] == marker
+        assert output["ExportName"] == export_name
+        exports = {e["Name"]: e for e in _all_pages(cfn, "list_exports", "Exports")}
+        assert exports[export_name]["ExportingStackId"] == child_id
+        assert exports[export_name]["Value"] == marker
+
+        cfn.create_stack(StackName=importer_name, TemplateBody=importer)
+        stack = _wait_stack(cfn, importer_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, importer_name)
+        assert ssm.get_parameter(Name=f"/cfn-nested-export-{suffix}/imported")[
+            "Parameter"]["Value"] == marker
+
+        cfn.delete_stack(StackName=importer_name)
+        assert _wait_stack(cfn, importer_name)["StackStatus"] == "DELETE_COMPLETE"
+        cfn.delete_stack(StackName=parent_name)
+        assert _wait_stack(cfn, parent_name)["StackStatus"] == "DELETE_COMPLETE"
+        assert export_name not in {
+            e["Name"] for e in _all_pages(cfn, "list_exports", "Exports")}
+    finally:
+        _delete_cfn_test_stack(cfn, importer_name)
+        _delete_cfn_test_stack(cfn, parent_name)
+        remove()
+
+
+def test_cfn_nested_stack_update_that_drops_an_export_releases_it(cfn, s3):
+    """An update of the nesting stack whose child no longer declares the Export
+    releases the name: ListExports omits it, and a stack importing it is
+    refused "Export '<name>' not found"."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    parent_name = f"cfn-nested-export-drop-{suffix}"
+    importer_name = f"cfn-nested-import-drop-{suffix}"
+    export_name, parent, importer, remove = _nested_export_world(s3, suffix)
+    try:
+        cfn.create_stack(StackName=parent_name, TemplateBody=parent("exporting.json"))
+        stack = _wait_stack(cfn, parent_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, parent_name)
+        assert export_name in {e["Name"] for e in _all_pages(cfn, "list_exports", "Exports")}
+
+        cfn.update_stack(StackName=parent_name, TemplateBody=parent("plain.json"))
+        stack = _wait_stack(cfn, parent_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, parent_name)
+        assert export_name not in {
+            e["Name"] for e in _all_pages(cfn, "list_exports", "Exports")}
+
+        cfn.create_stack(StackName=importer_name, TemplateBody=importer,
+                         DisableRollback=True)
+        stack = _wait_stack(cfn, importer_name)
+        assert stack["StackStatus"] == "CREATE_FAILED"
+        assert f"Export '{export_name}' not found" in stack["StackStatusReason"]
+    finally:
+        _delete_cfn_test_stack(cfn, importer_name)
+        _delete_cfn_test_stack(cfn, parent_name)
+        remove()
+
+
+def test_cfn_stack_update_that_drops_an_export_releases_it(cfn):
+    """A root stack updated without an output's Export releases the name, and
+    the export it keeps stays recorded with its new value."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-export-drop-{suffix}"
+    dropped, kept = f"cfn-export-drop-{suffix}-A", f"cfn-export-drop-{suffix}-B"
+
+    def template(export_a, value_b):
+        outputs = {"A": {"Value": "a"},
+                   "B": {"Value": value_b, "Export": {"Name": kept}}}
+        if export_a:
+            outputs["A"]["Export"] = {"Name": dropped}
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"Marker": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Type": "String", "Value": value_b}}},
+            "Outputs": outputs,
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(True, "b1"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        exports = {e["Name"]: e["Value"] for e in _all_pages(cfn, "list_exports", "Exports")}
+        assert exports[dropped] == "a"
+        assert exports[kept] == "b1"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(False, "b2"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        exports = {e["Name"]: e["Value"] for e in _all_pages(cfn, "list_exports", "Exports")}
+        assert dropped not in exports
+        assert exports[kept] == "b2"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_nested_stack_long_name_lambda_functions_get_distinct_physical_names(cfn, s3, lam):
     """Regression test: a nested stack's own auto-generated name (parent name
     + nested-stack logical id + a CloudFormation-assigned suffix — exactly
