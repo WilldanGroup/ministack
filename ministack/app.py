@@ -875,6 +875,15 @@ def _handle_lambda_download_request(path: str, method: str):
     return None
 
 
+def _handle_codebuild_credentials_request(path: str, method: str):
+    """Serve an executing build its project role's session, where the build's
+    AWS_CONTAINER_CREDENTIALS_FULL_URI points."""
+    prefix = "/_ministack/codebuild/credentials/"
+    if method == "GET" and path.startswith(prefix):
+        return _get_module("codebuild").serve_build_credentials(path[len(prefix):])
+    return None
+
+
 async def _handle_cognito_get_request(method: str, path: str, headers: dict, query_params: dict):
     """Handle Cognito GET endpoints that do not require request body parsing."""
     if "/.well-known/" in path and method == "GET":
@@ -1187,6 +1196,7 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
         _handle_ready_request(path, request_id),
         _handle_unknown_localstack_request(path, request_id),
         _handle_lambda_download_request(path, method),
+        _handle_codebuild_credentials_request(path, method),
     ):
         if response is not None:
             return response

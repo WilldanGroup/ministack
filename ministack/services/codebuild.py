@@ -18,10 +18,13 @@ really run them (see "Build execution" below).
 
 import contextvars
 import copy
+import datetime
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 
@@ -342,6 +345,90 @@ def _aws_endpoint():
     return f"http://{gateway}:{port}"
 
 
+# The path a build container reads its session on; the token after it names
+# one build's session and is unguessable, as CodeBuild's own endpoint is.
+CREDENTIALS_PATH = "/_ministack/codebuild/credentials/"
+
+_build_sessions = {}                     # token -> session answer
+_build_session_tokens = {}               # build id -> token
+_build_sessions_lock = threading.Lock()
+
+
+def _build_session(project, build):
+    """Mint a session of the project's service role for one build.
+
+    CodeBuild runs a build as its project's service role. The session is
+    minted the way the Lambda runtime mints a function's
+    (core.lambda_runtime.execution_credentials) and registered with STS, so a
+    call signed with it is evaluated as the role and lands in the role's
+    account. Unlike a function's, it is minted without AUTH too: CodeBuild
+    always serves a session with a token, and a buildspec may require one.
+    """
+    role_arn = project.get("serviceRole", "")
+    try:
+        account_id = parse_arn(role_arn).account_id or get_account_id()
+    except ArnParseError:
+        account_id = get_account_id()
+    role_name = role_arn.rsplit("/", 1)[-1]
+    session_name = f"AWSCodeBuild-{build['id'].split(':', 1)[-1]}"[:64]
+    digest = hashlib.sha256(f"{build['arn']}:{role_arn}".encode()).hexdigest()
+    access_key = f"ASIA{digest[:16].upper()}"
+    secret_key = hashlib.sha256(f"secret:{digest}".encode()).hexdigest()
+    session_token = hashlib.sha256(f"token:{digest}".encode()).hexdigest()
+    # The session outlives the build's own timeout, so no build sees it lapse.
+    expires = time.time() + _timeout_seconds(project) + 900
+
+    from ministack.services import sts as sts_svc
+
+    sts_svc.register_session(access_key, {
+        "Arn": f"arn:aws:sts::{account_id}:assumed-role/{role_name}/{session_name}",
+        "UserId": f"{role_name}:{session_name}",
+        "SecretAccessKey": secret_key,
+        "SessionToken": session_token,
+        "Expiration": expires,
+        "AccountId": account_id,
+        "PrincipalType": "AssumedRole",
+    })
+    return {
+        "AccessKeyId": access_key,
+        "SecretAccessKey": secret_key,
+        "Token": session_token,
+        "Expiration": datetime.datetime.fromtimestamp(expires, datetime.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "RoleArn": role_arn,
+    }
+
+
+def _serve_build_session(project, build):
+    """Mint the build's session and answer it at a token of its own; return
+    the token and the session."""
+    session = _build_session(project, build)
+    token = secrets.token_hex(16)
+    with _build_sessions_lock:
+        _build_sessions[token] = session
+        _build_session_tokens[build["id"]] = token
+    return token, session
+
+
+def _withdraw_build_session(build_id):
+    """Stop answering a build's session once the build has ended."""
+    with _build_sessions_lock:
+        token = _build_session_tokens.pop(build_id, None)
+        if token:
+            _build_sessions.pop(token, None)
+
+
+def serve_build_credentials(token):
+    """GET <CREDENTIALS_PATH><token>: the session of the build the token names,
+    in the shape a container credential endpoint answers."""
+    with _build_sessions_lock:
+        session = _build_sessions.get(token)
+    if session is None:
+        return 404, {"Content-Type": "application/json"}, json.dumps(
+            {"message": "no build holds this credential token"}).encode()
+    return 200, {"Content-Type": "application/json"}, json.dumps(session).encode()
+
+
 def _write_env_file(path, project, build):
     env = project.get("environment", {}) or {}
     declared = {var.get("name") for var in env.get("environmentVariables") or []}
@@ -357,8 +444,17 @@ def _write_env_file(path, project, build):
         endpoint = _aws_endpoint()
         if endpoint and "AWS_ENDPOINT_URL" not in declared:
             fh.write(f"AWS_ENDPOINT_URL={endpoint}\n")
-            for name, value in (("AWS_ACCESS_KEY_ID", "test"),
-                                ("AWS_SECRET_ACCESS_KEY", "test")):
+            # The build runs as its project's service role. CodeBuild serves
+            # the role's session at AWS_CONTAINER_CREDENTIALS_FULL_URI, and so
+            # does this endpoint. The AWS SDKs read a plain-http full URI only
+            # from a loopback or link-local host, which the bridge gateway is
+            # not, so the same session is also in the SDK's own variables, the
+            # way Lambda hands a function its role's session.
+            token, session = _serve_build_session(project, build)
+            fh.write(f"AWS_CONTAINER_CREDENTIALS_FULL_URI={endpoint}{CREDENTIALS_PATH}{token}\n")
+            for name, value in (("AWS_ACCESS_KEY_ID", session["AccessKeyId"]),
+                                ("AWS_SECRET_ACCESS_KEY", session["SecretAccessKey"]),
+                                ("AWS_SESSION_TOKEN", session["Token"])):
                 if name not in declared:
                     fh.write(f"{name}={value}\n")
 
@@ -462,6 +558,7 @@ def _execute_build(build_id, project):
         container = client.containers.run(AGENT_IMAGE, **run_kwargs)
     except Exception:
         logger.exception("Failed to start build %s", build_id)
+        _withdraw_build_session(build_id)
         _finish_build(build, "FAULT")
         return
 
@@ -538,6 +635,7 @@ def _execute_build(build_id, project):
     finally:
         timeout.cancel()
         _clear_stopped(build_id)
+        _withdraw_build_session(build_id)
         if not saw_phase:
             logger.warning(
                 "Build %s produced no 'Phase complete' lines; %s may not report "
