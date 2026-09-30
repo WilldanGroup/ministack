@@ -251,6 +251,48 @@ exec /usr/local/bin/docker-compose "$@"
 """
 
 
+def _compose_project(build_id):
+    """The docker-compose project one build's agent brings up.
+
+    The agent names its project after its working directory, agent-resources,
+    so every build shared one: the agent's own cleanup — a `down -v` at the
+    start of each run — took down whatever build was running under that name,
+    on this MiniStack or another on the same daemon, and nothing took down the
+    last one. A project per build is what lets the build's end remove exactly
+    its own (_remove_compose_project).
+    """
+    suffix = re.sub(r"[^a-z0-9_-]", "-", build_id.rsplit(":", 1)[-1].lower())
+    return f"ministack-codebuild-{suffix}"
+
+
+def _remove_compose_project(client, project):
+    """Remove what the agent's docker-compose made for one build: its agent and
+    build containers, then their network and named volumes, which compose
+    labels with the project. Best effort, each on its own: a build's end must
+    not fail over its cleanup."""
+    selector = {"label": f"com.docker.compose.project={project}"}
+
+    def _each(kind, listed, remove):
+        try:
+            items = listed()
+        except Exception as exc:
+            logger.warning("Could not list the %ss of %s: %s", kind, project, exc)
+            return
+        for item in items:
+            try:
+                remove(item)
+            except Exception as exc:
+                logger.warning("Could not remove %s %s of %s: %s",
+                               kind, getattr(item, "name", item), project, exc)
+
+    # Containers first: a network or volume still in use cannot be removed.
+    _each("container", lambda: client.containers.list(all=True, filters=selector),
+          lambda c: c.remove(force=True, v=True))
+    _each("network", lambda: client.networks.list(filters=selector), lambda n: n.remove())
+    _each("volume", lambda: client.volumes.list(filters=selector),
+          lambda v: v.remove(force=True))
+
+
 _PHASE_COMPLETE_RE = re.compile(r"Phase complete: ([A-Z_]+) State: ([A-Z_]+)")
 
 _docker = None
@@ -522,6 +564,7 @@ def _execute_build(build_id, project):
     source_dir = os.path.join(workdir, "src")
     artifacts_dir = os.path.join(workdir, "artifacts")
     env_dir = os.path.join(workdir, "env")
+    compose_project = _compose_project(build_id)
 
     try:
         for path in (source_dir, artifacts_dir, env_dir):
@@ -579,6 +622,9 @@ def _execute_build(build_id, project):
             run_kwargs["environment"].update(extra.pop("environment", {}))
             run_kwargs.update(extra)
 
+        # After the flags: the build's end removes this project, so it is not
+        # the flags' to rename.
+        run_kwargs["environment"]["COMPOSE_PROJECT_NAME"] = compose_project
         container = client.containers.run(AGENT_IMAGE, **run_kwargs)
     except Exception:
         logger.exception("Failed to start build %s", build_id)
@@ -669,6 +715,9 @@ def _execute_build(build_id, project):
             container.remove(force=True, v=True)
         except Exception:
             pass
+        # After the agent: one stopped or timed out mid-build leaves its
+        # project's containers running, and they hold the volumes.
+        _remove_compose_project(client, compose_project)
 
 
 # ---------------------------------------------------------------------------
