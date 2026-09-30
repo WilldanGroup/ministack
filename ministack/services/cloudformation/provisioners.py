@@ -4090,7 +4090,12 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         _topological_sort,
     )
     from ministack.services.cloudformation.helpers import _resolve_template
-    from ministack.services.cloudformation.stacks import _add_event, _resource_policy
+    from ministack.services.cloudformation.stacks import (
+        _add_event,
+        _resolve_stack_outputs,
+        _resource_policy,
+        _set_stack_exports,
+    )
 
     template_url = props.get("TemplateURL")
     if not template_url:
@@ -4357,23 +4362,18 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                 stale["ResourceStatusReason"] = str(exc)
                 stale["Timestamp"] = now_iso()
 
-    resolved_outputs = []
-    output_attrs: dict[str, str] = {}
-    for out_name, out_def in outputs_defs.items():
-        cond = out_def.get("Condition")
-        if cond and not conditions.get(cond, True):
-            continue
-        out_value = _resolve_refs(
-            copy.deepcopy(out_def.get("Value", "")),
-            provisioned, param_values, conditions,
-            mappings, child_name, child_stack_id,
-        )
-        resolved_outputs.append({
-            "OutputKey": out_name,
-            "OutputValue": str(out_value),
-            "Description": out_def.get("Description", ""),
-        })
-        output_attrs[f"Outputs.{out_name}"] = str(out_value)
+    # The child's outputs resolve as a root stack's do, in the child's own
+    # scope, so an output's Export is recorded under the child's StackId:
+    # ListExports lists it, Fn::ImportValue reads it, and an update that
+    # drops it releases it.
+    resolved_outputs, exports = _resolve_stack_outputs(
+        outputs_defs, conditions, provisioned, param_values,
+        mappings, child_name, child_stack_id,
+    )
+    output_attrs = {f"Outputs.{out['OutputKey']}": out["OutputValue"]
+                    for out in resolved_outputs}
+    _set_stack_exports(child_stack_id,
+                       (previous_stack_snapshot or {}).get("Outputs"), exports)
 
     child_stack["Outputs"] = resolved_outputs
     child_stack["StackStatus"] = f"{status_prefix}_COMPLETE"

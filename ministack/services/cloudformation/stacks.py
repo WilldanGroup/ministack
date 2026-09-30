@@ -271,6 +271,24 @@ def _resolve_stack_outputs(outputs_defs, conditions, resources, param_values,
     return resolved_outputs, exports
 
 
+def _set_stack_exports(stack_id, previous_outputs, exports):
+    """Make ``exports`` the exports of the stack ``stack_id``, root or nested.
+
+    Each name the stack exported before (an ``ExportName`` on
+    ``previous_outputs``) that ``exports`` no longer carries is released, as an
+    update that drops an ``Export`` releases it on AWS; then each of
+    ``exports`` is recorded. A name another stack has recorded since is not
+    this stack's to release.
+    """
+    from ministack.services.cloudformation import _exports
+    for out in previous_outputs or []:
+        name = out.get("ExportName")
+        if (name and name not in exports
+                and _exports.get(name, {}).get("StackId") == stack_id):
+            _exports.pop(name, None)
+    _exports.update(exports)
+
+
 def _rollback_failure_reason(failed_records: dict) -> str:
     """The reason of a rollback that could not finish: failed reverts, then failed deletes."""
     reverts = sorted(k for k, v in failed_records.items() if "RevertTo" in v)
@@ -603,7 +621,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
     ``retain_except_on_create`` is the API parameter of the same name: a
     rollback of this operation then deletes what the operation created even
     when the template says ``DeletionPolicy: Retain``."""
-    from ministack.services.cloudformation import _exports, _stacks
+    from ministack.services.cloudformation import _stacks
     status_prefix = "UPDATE" if is_update else "CREATE"
     stack = _stacks[stack_name]
     stack.pop("_failed_operation", None)
@@ -951,7 +969,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
     stack["_resources"] = provisioned_resources
     stack["_template"] = template
     stack["_resolved_params"] = param_values
-    _exports.update(new_exports)
+    _set_stack_exports(stack_id, stack.get("Outputs"), new_exports)
     stack["Outputs"] = resolved_outputs
     stack["StackStatus"] = f"{status_prefix}_COMPLETE"
     _add_event(stack_id, stack_name, stack_name,
