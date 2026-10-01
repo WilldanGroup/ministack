@@ -2417,6 +2417,7 @@ async def _dispatch_service_request(
         from ministack.core.iam_actions import (
             access_denied_response,
             agentcore_endpoint_arn,
+            cloudformation_service_context,
             dynamodb_resource_arns,
             dynamodb_service_context,
             dynamodb_transaction_checks,
@@ -2440,6 +2441,8 @@ async def _dispatch_service_request(
                 service_context = dynamodb_service_context(body)
             elif service == "kms":
                 service_context = kms_service_context(resource_arn)
+            elif service == "cloudformation":
+                service_context = cloudformation_service_context(resource_arn)
             else:
                 service_context = None
             transaction = (

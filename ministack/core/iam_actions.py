@@ -1707,6 +1707,37 @@ def kms_service_context(resource_arn: str) -> dict:
     )}
 
 
+def cloudformation_service_context(resource_arn: str) -> dict:
+    """The tags of the stack a check against ``resource_arn`` names, as the
+    ``aws:ResourceTag/<key>`` condition keys AWS supplies for a stack.
+
+    A stack ARN is ``stack/<name>/<id>``, or ``stack/<name>/*`` where the
+    request named the stack. A stack that does not stand carries none: the
+    stack a request is about to create is not yet a resource with tags, so a
+    statement bounded by its tags does not match it, as in AWS.
+    """
+    from ministack.services.cloudformation import _stacks
+
+    parts = resource_arn.split(":", 5)
+    if len(parts) != 6 or parts[2] != "cloudformation" or not parts[5].startswith("stack/"):
+        return {}
+    _, _, _, region, account_id, resource = parts
+    segments = resource.split("/")
+    if len(segments) < 2:
+        return {}
+    stack = _stacks.get_scoped(account_id, region, segments[1])
+    if stack is None and len(segments) > 2 and segments[2] != "*":
+        stack = next((candidate for _, candidate in _stacks.items_scoped(account_id, region)
+                      if candidate.get("StackId") == resource_arn), None)
+    if not isinstance(stack, dict) or stack.get("StackStatus") == "DELETE_COMPLETE":
+        return {}
+    return {
+        f"aws:ResourceTag/{tag['Key']}": tag.get("Value", "")
+        for tag in stack.get("Tags") or []
+        if isinstance(tag, dict) and "Key" in tag
+    }
+
+
 def eventbridge_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
     """Every event-bus ARN a ``PutEvents`` request addresses, in request order.
 
