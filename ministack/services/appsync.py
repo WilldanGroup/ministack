@@ -1624,9 +1624,14 @@ def _request_is_authenticated(api_id, api, request_headers):
         supplied = headers.get("x-api-key")
         if supplied and supplied in (_api_keys.get(api_id) or {}):
             return True
-    if {"AMAZON_COGNITO_USER_POOLS", "OPENID_CONNECT"} & modes:
+    if "AMAZON_COGNITO_USER_POOLS" in modes:
         # A bearer token, as distinct from a SigV4 credential.
         if auth and not auth.startswith("AWS4-HMAC-SHA256"):
+            return True
+    if "OPENID_CONNECT" in modes and auth and not auth.startswith("AWS4-HMAC-SHA256"):
+        # Under AUTH, only a token one of the API's issuers verifies; without
+        # it, any bearer, as before.
+        if not _verifying() or _oidc_identity(api, request_headers) is not None:
             return True
     if "AWS_IAM" in modes and auth.startswith("AWS4-HMAC-SHA256"):
         return True
@@ -1644,6 +1649,8 @@ def _execute_with_schema(api_id, sdl, query, variables, operation_name, request_
     identity = None
     if api.get("userPoolConfig"):
         identity = _cognito_identity(api, request_headers)
+    if identity is None:
+        identity = _oidc_identity(api, request_headers)
     if api.get("lambdaAuthorizerConfig"):
         try:
             identity = _invoke_lambda_authorizer(
@@ -1747,6 +1754,8 @@ def _execute_graphql(api_id, data, request_headers=None):
     # it null makes every permission check fail against an API that works on AWS.
     if api.get("userPoolConfig"):
         identity = _cognito_identity(api, request_headers or {})
+    if identity is None:
+        identity = _oidc_identity(api, request_headers or {})
     if api.get("lambdaAuthorizerConfig"):
         try:
             identity = _invoke_lambda_authorizer(
@@ -2251,6 +2260,158 @@ def _cognito_identity(api, request_headers):
         "defaultAuthStrategy": (api.get("userPoolConfig") or {}).get("defaultAction", "ALLOW"),
         "groups": claims.get("cognito:groups"),
         "issuer": claims.get("iss"),
+    }
+
+
+def _verifying():
+    """Whether tokens are verified: the AUTH switch that turns IAM on."""
+    from ministack import app as _app
+    return bool(getattr(_app, "AUTH", False))
+
+
+def _bearer(request_headers):
+    """The bearer token a request carries, or "" for none or a SigV4 credential."""
+    auth = request_headers.get("authorization") or request_headers.get("Authorization") or ""
+    if not auth or auth.startswith("AWS4-HMAC-SHA256"):
+        return ""
+    return auth[7:] if auth[:7].lower() == "bearer " else auth
+
+
+def _oidc_configs(api):
+    """Every OPENID_CONNECT provider's configuration on the API, the default first."""
+    configs = []
+    if api.get("authenticationType") == "OPENID_CONNECT" and api.get("openIDConnectConfig"):
+        configs.append(api["openIDConnectConfig"])
+    for extra in api.get("additionalAuthenticationProviders") or []:
+        if (isinstance(extra, dict) and extra.get("authenticationType") == "OPENID_CONNECT"
+                and extra.get("openIDConnectConfig")):
+            configs.append(extra["openIDConnectConfig"])
+    return configs
+
+
+_OIDC_KEYS = {}  # issuer -> (fetched at, {kid: jwk})
+_OIDC_KEYS_TTL = 300
+
+
+def _fetch_json(url):
+    """A JSON document over HTTP(S), as the issuer publishes it."""
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=10) as response:  # noqa: S310 - the issuer's own URL
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _oidc_keys(issuer):
+    """The issuer's signing keys by kid: its discovery document's jwks_uri, read
+    and kept for five minutes."""
+    held = _OIDC_KEYS.get(issuer)
+    if held and time.time() - held[0] < _OIDC_KEYS_TTL:
+        return held[1]
+    discovery = _fetch_json(issuer.rstrip("/") + "/.well-known/openid-configuration")
+    jwks = _fetch_json(discovery["jwks_uri"])
+    keys = {key.get("kid", ""): key for key in jwks.get("keys", []) if isinstance(key, dict)}
+    _OIDC_KEYS[issuer] = (time.time(), keys)
+    return keys
+
+
+class _OidcRefused(Exception):
+    pass
+
+
+def _b64url(part):
+    return base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+
+
+def _verified_oidc_claims(token, config, now=None):
+    """The token's claims, once verified against one OPENID_CONNECT provider the
+    way AppSync verifies them: the issuer's JWKS signature, `iss`, the expiry,
+    `iat` and `auth_time` against the configured TTLs (milliseconds), and the
+    clientId as a regular expression matched against `aud` or `azp`."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+    now = time.time() if now is None else now
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise _OidcRefused("the token is not a JWT")
+    try:
+        header = json.loads(_b64url(parts[0]))
+        claims = json.loads(_b64url(parts[1]))
+        signature = _b64url(parts[2])
+    except Exception:
+        raise _OidcRefused("the token cannot be read")
+    if header.get("alg") != "RS256":
+        raise _OidcRefused(f"the token is signed {header.get('alg')}, not RS256")
+    issuer = str(config.get("issuer") or "")
+    if str(claims.get("iss") or "").rstrip("/") != issuer.rstrip("/"):
+        raise _OidcRefused(f"the token's issuer is not {issuer}")
+    try:
+        jwk = _oidc_keys(issuer).get(header.get("kid", ""))
+    except Exception as exc:
+        raise _OidcRefused(f"the issuer's keys cannot be read: {exc}")
+    if not jwk or jwk.get("kty") != "RSA":
+        raise _OidcRefused("the issuer publishes no RSA key by the token's kid")
+    public = rsa.RSAPublicNumbers(
+        int.from_bytes(_b64url(jwk["e"]), "big"),
+        int.from_bytes(_b64url(jwk["n"]), "big"),
+    ).public_key()
+    try:
+        public.verify(signature, f"{parts[0]}.{parts[1]}".encode("ascii"),
+                      padding.PKCS1v15(), hashes.SHA256())
+    except Exception:
+        raise _OidcRefused("the token's signature does not verify")
+    if "exp" in claims and float(claims["exp"]) <= now:
+        raise _OidcRefused("the token has expired")
+    iat_ttl = config.get("iatTTL")
+    if iat_ttl and "iat" in claims and now - float(claims["iat"]) > float(iat_ttl) / 1000:
+        raise _OidcRefused("the token was issued longer ago than iatTTL")
+    auth_ttl = config.get("authTTL")
+    if auth_ttl and "auth_time" in claims and now - float(claims["auth_time"]) > float(auth_ttl) / 1000:
+        raise _OidcRefused("the token's authentication is older than authTTL")
+    client_id = config.get("clientId")
+    if client_id:
+        audiences = claims.get("aud")
+        named = (audiences if isinstance(audiences, list) else [audiences]) + [claims.get("azp")]
+        if not any(isinstance(value, str) and re.fullmatch(client_id, value) for value in named):
+            raise _OidcRefused(f"the token names no audience {client_id} matches")
+    return claims
+
+
+def _oidc_identity(api, request_headers):
+    """ctx.identity for a bearer token one of the API's OPENID_CONNECT providers
+    verifies — the token's claims, its issuer and its subject — or None.
+
+    Verified under the AUTH switch, as the IAM evaluation is; without it the
+    claims are read unverified, as a Cognito token's are.
+    """
+    token = _bearer(request_headers)
+    if not token:
+        return None
+    configs = _oidc_configs(api)
+    if not configs:
+        return None
+    if _verifying():
+        for config in configs:
+            try:
+                claims = _verified_oidc_claims(token, config)
+            except _OidcRefused as refused:
+                logger.debug("AppSync OIDC: %s (%s)", refused, config.get("issuer"))
+                continue
+            break
+        else:
+            return None
+    else:
+        parts = token.split(".")
+        try:
+            claims = json.loads(_b64url(parts[1])) if len(parts) == 3 else None
+        except Exception:
+            claims = None
+        if not isinstance(claims, dict):
+            return None
+    return {
+        "claims": claims,
+        "issuer": claims.get("iss"),
+        "sub": claims.get("sub"),
+        "sourceIp": ["127.0.0.1"],
     }
 
 
