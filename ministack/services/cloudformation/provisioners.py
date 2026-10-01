@@ -6164,15 +6164,42 @@ def _appsync_domain_association_delete(physical_id, props):
     _appsync._disassociate_api(physical_id)
 
 
+def _appsync_camel(value):
+    """A template's PascalCase block in the camelCase the AppSync API holds:
+    TableName, AwsRegion and LambdaFunctionArn as tableName, awsRegion and
+    lambdaFunctionArn, nested blocks alike."""
+    if isinstance(value, dict):
+        return {(k[:1].lower() + k[1:]) if isinstance(k, str) else k: _appsync_camel(v)
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_appsync_camel(v) for v in value]
+    return value
+
+
+# A data source's configuration blocks: the template's name, the API's name.
+_APPSYNC_DS_CONFIGS = {
+    "DynamoDBConfig": "dynamodbConfig",
+    "LambdaConfig": "lambdaConfig",
+    "HttpConfig": "httpConfig",
+    "RelationalDatabaseConfig": "relationalDatabaseConfig",
+    "OpenSearchServiceConfig": "openSearchServiceConfig",
+    "ElasticsearchConfig": "elasticsearchConfig",
+    "EventBridgeConfig": "eventBridgeConfig",
+}
+
+
 def _appsync_ds_create(logical_id, props, stack_name):
     api_id = props.get("ApiId", "")
     name = props.get("Name") or logical_id
     ds_type = props.get("Type", "NONE")
     body = {"name": name, "type": ds_type}
-    if props.get("DynamoDBConfig"):
-        body["dynamodbConfig"] = props["DynamoDBConfig"]
-    if props.get("LambdaConfig"):
-        body["lambdaConfig"] = props["LambdaConfig"]
+    # Each block as CreateDataSource holds it, so the resolvers that read
+    # dynamodbConfig.tableName or lambdaConfig.lambdaFunctionArn find them.
+    for template_key, api_key in _APPSYNC_DS_CONFIGS.items():
+        if props.get(template_key):
+            body[api_key] = _appsync_camel(props[template_key])
+    if props.get("Description"):
+        body["description"] = props["Description"]
     if props.get("ServiceRoleArn"):
         body["serviceRoleArn"] = props["ServiceRoleArn"]
     _appsync._data_sources.setdefault(api_id, {})[name] = {
