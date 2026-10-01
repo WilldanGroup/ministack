@@ -248,21 +248,23 @@ function makeGlobals(state) {
 // @aws-appsync/utils/dynamodb — unlike the root package, this one is not
 // types-only: its helpers build the request objects a resolver returns. They
 // are pure functions over their arguments, so they are reimplemented here
-// rather than resolved from node_modules the resolver does not ship with.
-function makeDdbHelpers() {
+// rather than resolved from node_modules the resolver does not ship with. As
+// the real module does, they hand the data source typed values: a key and an
+// item are converted with util.dynamodb.toMapValues.
+function makeDdbHelpers(toMapValues) {
   const cond = (c) => (c === undefined ? undefined : c);
   return {
-    get: ({ key }) => ({ operation: "GetItem", key }),
+    get: ({ key }) => ({ operation: "GetItem", key: toMapValues(key) }),
     put: ({ key, item, condition }) => ({
-      operation: "PutItem", key, attributeValues: item || {},
+      operation: "PutItem", key: toMapValues(key), attributeValues: toMapValues(item || {}),
       ...(cond(condition) ? { condition } : {}),
     }),
     update: ({ key, update, condition }) => ({
-      operation: "UpdateItem", key, update: update || {},
+      operation: "UpdateItem", key: toMapValues(key), update: update || {},
       ...(cond(condition) ? { condition } : {}),
     }),
     remove: ({ key, condition }) => ({
-      operation: "DeleteItem", key,
+      operation: "DeleteItem", key: toMapValues(key),
       ...(cond(condition) ? { condition } : {}),
     }),
     scan: ({ filter, index, limit, nextToken, consistentRead, segment, totalSegments } = {}) => ({
@@ -449,9 +451,11 @@ ${stripped}
   // the module per call would throw on any top-level const it declares —
   // including the binding for the dynamodb helpers.
   const state = { appended: [], extensions: [] };
-  const sandbox = { __exports: handlers, __ddb: makeDdbHelpers(), console, JSON,
+  const globals = makeGlobals(state);
+  const sandbox = { __exports: handlers,
+                    __ddb: makeDdbHelpers(globals.util.dynamodb.toMapValues), console, JSON,
                     Math, Date, Object, Array, String, Number, Boolean, RegExp,
-                    Map, Set, Error, ...makeGlobals(state) };
+                    Map, Set, Error, ...globals };
   vm.createContext(sandbox);
   new vm.Script(src, { filename: "resolver.js" }).runInContext(sandbox);
   const entry = { sandbox, handlers, state };

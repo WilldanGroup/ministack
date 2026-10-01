@@ -2014,30 +2014,296 @@ def _ds_dynamodb(api_id, data_source, request_obj, ctx):
 
 
 def _ds_dynamodb_in_region(api_id, data_source, request_obj, ctx):
-    import ministack.services.dynamodb as _ddb
+    """A resolver's DynamoDB request as AppSync runs it.
 
+    Each operation of AppSync's DynamoDB request reference is translated to the
+    DynamoDB API call it names and run by this emulator's own DynamoDB, so a
+    key condition, an index, a filter, a limit, an update expression, a
+    condition and a page token mean what they mean there; the answer is put in
+    AppSync's shape, plain values rather than AttributeValues.
+    """
     cfg = data_source.get("dynamodbConfig", {})
     table_name = cfg.get("tableName", "")
-    table = _ddb._tables.get(table_name) if table_name else None
-    if table is None:
-        return None
-
     req = request_obj if isinstance(request_obj, dict) else {}
     op = req.get("operation", "GetItem")
-    # AppSync's DynamoDB helpers emit AttributeValue-shaped keys and values.
-    key = _ddb_plain(req.get("key") or {})
-    if op == "GetItem":
-        return _ddb_get_item(table, table_name, key, None)
-    if op in ("PutItem", "UpdateItem"):
-        item = {**key, **_ddb_plain(req.get("attributeValues") or {})}
-        return (_ddb_put_item if op == "PutItem" else _ddb_update_item)(
-            table, table_name, item)
-    if op == "DeleteItem":
-        return _ddb_delete_item(table, table_name, key)
-    if op in ("Scan", "Query"):
-        return _ddb_scan(table, table_name, key, None)
-    raise _AppSyncResolverError(
-        f"DynamoDB operation {op} is not supported yet", "NotImplemented")
+    run = _APPSYNC_DDB_OPERATIONS.get(op)
+    if run is None:
+        raise _AppSyncResolverError(
+            f"DynamoDB operation {op} is not supported yet", "NotImplemented")
+    return run(table_name, req)
+
+
+def _ddb_call(action, data):
+    """One call of this emulator's DynamoDB API: (answer, None) or (None, (code, message, answer))."""
+    import ministack.services.dynamodb as _ddb
+    handler = {
+        "GetItem": _ddb._get_item,
+        "PutItem": _ddb._put_item,
+        "UpdateItem": _ddb._update_item,
+        "DeleteItem": _ddb._delete_item,
+        "Query": _ddb._query,
+        "Scan": _ddb._scan,
+        "BatchGetItem": _ddb._batch_get_item,
+        "TransactWriteItems": _ddb._transact_write_items,
+    }[action]
+    status, _headers, body = handler(data)
+    text = body.decode("utf-8") if isinstance(body, bytes) else body
+    answer = json.loads(text) if text else {}
+    if status >= 400:
+        code = str(answer.get("__type") or "DynamoDbException").split("#")[-1]
+        return None, (code, answer.get("message") or answer.get("Message") or code, answer)
+    return answer, None
+
+
+def _ddb_refusal(failure, result=None):
+    """A DynamoDB refusal as AppSync reports it: its error type is the
+    exception's name under `DynamoDB:`."""
+    code, message, _answer = failure
+    return _AppSyncResolverError(message, f"DynamoDB:{code}", result=result)
+
+
+def _ddb_expression(data, expression, field):
+    """An AppSync expression block — expression, expressionNames,
+    expressionValues — as the request's `<field>` beside the names and values
+    every expression of one request shares."""
+    if not isinstance(expression, dict) or not expression.get("expression"):
+        return
+    data[field] = expression["expression"]
+    if expression.get("expressionNames"):
+        data.setdefault("ExpressionAttributeNames", {}).update(expression["expressionNames"])
+    if expression.get("expressionValues"):
+        data.setdefault("ExpressionAttributeValues", {}).update(expression["expressionValues"])
+
+
+def _ddb_page_token(token):
+    """AppSync's opaque page token, which carries DynamoDB's last evaluated key."""
+    if not token:
+        return None
+    try:
+        return json.loads(base64.urlsafe_b64decode(token.encode() + b"==").decode())
+    except Exception as exc:
+        raise _AppSyncResolverError(
+            f"Invalid pagination token: {token}", "DynamoDB:ValidationException") from exc
+
+
+def _ddb_next_token(last_key):
+    if not last_key:
+        return None
+    return base64.urlsafe_b64encode(json.dumps(last_key, sort_keys=True).encode()).decode().rstrip("=")
+
+
+def _ddb_get(table_name, key, consistent=True):
+    answer, _failure = _ddb_call(
+        "GetItem", {"TableName": table_name, "Key": key, "ConsistentRead": consistent})
+    item = (answer or {}).get("Item")
+    return _ddb_plain(item) if item else None
+
+
+def _ddb_op_get_item(table_name, req):
+    data = {"TableName": table_name, "Key": req.get("key") or {}}
+    if req.get("consistentRead") is not None:
+        data["ConsistentRead"] = bool(req["consistentRead"])
+    _ddb_projection(data, req.get("projection"))
+    answer, failure = _ddb_call("GetItem", data)
+    if failure:
+        raise _ddb_refusal(failure)
+    item = answer.get("Item")
+    return _ddb_plain(item) if item else None
+
+
+def _ddb_projection(data, projection):
+    if isinstance(projection, dict) and projection.get("expression"):
+        data["ProjectionExpression"] = projection["expression"]
+        if projection.get("expressionNames"):
+            data.setdefault("ExpressionAttributeNames", {}).update(projection["expressionNames"])
+
+
+def _ddb_condition_failed(table_name, key, condition, wanted):
+    """A failed condition as AppSync handles it: the item read again, and the
+    write answered as done where what stands is what it wanted to leave —
+    the item it would have put, apart from `equalsIgnore`, or no item for a
+    delete — and refused otherwise."""
+    current = _ddb_get(table_name, key, (condition or {}).get("consistentRead", True))
+    ignore = set((condition or {}).get("equalsIgnore") or [])
+    if wanted == "absent":
+        if current is None:
+            return True, None
+    elif wanted is not None and current is not None:
+        strip = lambda item: {k: v for k, v in item.items() if k not in ignore}
+        if strip(current) == strip(_ddb_plain(wanted)):
+            return True, current
+    return False, current
+
+
+def _ddb_op_put_item(table_name, req):
+    key = req.get("key") or {}
+    item = {**(req.get("attributeValues") or {}), **key}
+    data = {"TableName": table_name, "Item": item}
+    _ddb_expression(data, req.get("condition"), "ConditionExpression")
+    answer, failure = _ddb_call("PutItem", data)
+    if failure:
+        if failure[0] == "ConditionalCheckFailedException":
+            done, current = _ddb_condition_failed(table_name, key, req.get("condition"), item)
+            if done:
+                return current
+        raise _ddb_refusal(failure)
+    return _ddb_plain(item)
+
+
+def _ddb_op_update_item(table_name, req):
+    key = req.get("key") or {}
+    data = {"TableName": table_name, "Key": key, "ReturnValues": "ALL_NEW"}
+    _ddb_expression(data, req.get("update"), "UpdateExpression")
+    _ddb_expression(data, req.get("condition"), "ConditionExpression")
+    answer, failure = _ddb_call("UpdateItem", data)
+    if failure:
+        raise _ddb_refusal(failure)
+    attributes = answer.get("Attributes")
+    return _ddb_plain(attributes) if attributes else None
+
+
+def _ddb_op_delete_item(table_name, req):
+    key = req.get("key") or {}
+    data = {"TableName": table_name, "Key": key, "ReturnValues": "ALL_OLD"}
+    _ddb_expression(data, req.get("condition"), "ConditionExpression")
+    answer, failure = _ddb_call("DeleteItem", data)
+    if failure:
+        if failure[0] == "ConditionalCheckFailedException":
+            done, _current = _ddb_condition_failed(table_name, key, req.get("condition"), "absent")
+            if done:
+                return None
+        raise _ddb_refusal(failure)
+    attributes = answer.get("Attributes")
+    return _ddb_plain(attributes) if attributes else None
+
+
+def _ddb_op_read_many(action):
+    def run(table_name, req):
+        data = {"TableName": table_name}
+        if req.get("index"):
+            data["IndexName"] = req["index"]
+        if action == "Query":
+            _ddb_expression(data, req.get("query"), "KeyConditionExpression")
+            if req.get("scanIndexForward") is not None:
+                data["ScanIndexForward"] = bool(req["scanIndexForward"])
+        else:
+            if req.get("segment") is not None:
+                data["Segment"] = req["segment"]
+            if req.get("totalSegments") is not None:
+                data["TotalSegments"] = req["totalSegments"]
+        _ddb_expression(data, req.get("filter"), "FilterExpression")
+        _ddb_projection(data, req.get("projection"))
+        if req.get("limit") is not None:
+            data["Limit"] = int(req["limit"])
+        if req.get("consistentRead") is not None:
+            data["ConsistentRead"] = bool(req["consistentRead"])
+        if req.get("select"):
+            data["Select"] = req["select"]
+        start = _ddb_page_token(req.get("nextToken"))
+        if start:
+            data["ExclusiveStartKey"] = start
+        answer, failure = _ddb_call(action, data)
+        if failure:
+            raise _ddb_refusal(failure)
+        return {
+            "items": [_ddb_plain(item) for item in answer.get("Items") or []],
+            "nextToken": _ddb_next_token(answer.get("LastEvaluatedKey")),
+            "scannedCount": answer.get("ScannedCount", 0),
+        }
+    return run
+
+
+def _ddb_op_batch_get_item(_table_name, req):
+    """Each table's items in the order its keys were asked, null where a key
+    holds none, and the keys DynamoDB left unprocessed."""
+    asked = {}
+    request_items = {}
+    for table, spec in (req.get("tables") or {}).items():
+        spec = {"keys": spec} if isinstance(spec, list) else (spec or {})
+        keys = spec.get("keys") or []
+        asked[table] = keys
+        entry = {"Keys": keys}
+        if spec.get("consistentRead") is not None:
+            entry["ConsistentRead"] = bool(spec["consistentRead"])
+        _ddb_projection(entry, spec.get("projection"))
+        if keys:
+            request_items[table] = entry
+    answer = {}
+    if request_items:
+        answer, failure = _ddb_call("BatchGetItem", {"RequestItems": request_items})
+        if failure:
+            raise _ddb_refusal(failure)
+    data, unprocessed = {}, {}
+    for table, keys in asked.items():
+        found = [_ddb_plain(item) for item in (answer.get("Responses") or {}).get(table) or []]
+        rows = []
+        for key in keys:
+            plain_key = _ddb_plain(key)
+            rows.append(next((item for item in found
+                              if all(item.get(k) == v for k, v in plain_key.items())), None))
+        data[table] = rows
+        left = ((answer.get("UnprocessedKeys") or {}).get(table) or {}).get("Keys") or []
+        unprocessed[table] = [_ddb_plain(key) for key in left]
+    return {"data": data, "unprocessedKeys": unprocessed}
+
+
+_TRANSACT_SHAPES = {
+    "PutItem": "Put",
+    "UpdateItem": "Update",
+    "DeleteItem": "Delete",
+    "ConditionCheck": "ConditionCheck",
+}
+
+
+def _ddb_op_transact_write_items(_table_name, req):
+    """Every item written or none: their keys in order, or AppSync's
+    cancellation reasons in ctx.result beside the error."""
+    items = req.get("transactItems") or []
+    transact = []
+    for entry in items:
+        shape = _TRANSACT_SHAPES.get(entry.get("operation"))
+        if shape is None:
+            raise _AppSyncResolverError(
+                f"TransactWriteItems operation {entry.get('operation')} is not supported",
+                "DynamoDB:ValidationException")
+        key = entry.get("key") or {}
+        body = {"TableName": entry.get("table")}
+        if shape == "Put":
+            body["Item"] = {**(entry.get("attributeValues") or {}), **key}
+        else:
+            body["Key"] = key
+        if shape == "Update":
+            _ddb_expression(body, entry.get("update"), "UpdateExpression")
+        _ddb_expression(body, entry.get("condition"), "ConditionExpression")
+        condition = entry.get("condition") or {}
+        if condition.get("returnValuesOnConditionCheckFailure", True) is not False:
+            body["ReturnValuesOnConditionCheckFailure"] = "ALL_OLD"
+        transact.append({shape: body})
+    answer, failure = _ddb_call("TransactWriteItems", {"TransactItems": transact})
+    if failure:
+        reasons = [
+            {
+                "type": reason.get("Code") or "None",
+                "message": reason.get("Message") or "None",
+                **({"item": _ddb_plain(reason["Item"])} if reason.get("Item") else {}),
+            }
+            for reason in failure[2].get("CancellationReasons") or []
+        ]
+        raise _ddb_refusal(failure, result={"keys": None, "cancellationReasons": reasons})
+    return {"keys": [_ddb_plain(entry.get("key") or {}) for entry in items],
+            "cancellationReasons": None}
+
+
+_APPSYNC_DDB_OPERATIONS = {
+    "GetItem": _ddb_op_get_item,
+    "PutItem": _ddb_op_put_item,
+    "UpdateItem": _ddb_op_update_item,
+    "DeleteItem": _ddb_op_delete_item,
+    "Query": _ddb_op_read_many("Query"),
+    "Scan": _ddb_op_read_many("Scan"),
+    "BatchGetItem": _ddb_op_batch_get_item,
+    "TransactWriteItems": _ddb_op_transact_write_items,
+}
 
 
 def _ddb_plain(value):
@@ -2156,11 +2422,15 @@ _DATA_SOURCE_HANDLERS = {
 
 
 class _AppSyncResolverError(Exception):
-    def __init__(self, message, error_type="UnknownError", data=None, error_info=None):
+    def __init__(self, message, error_type="UnknownError", data=None, error_info=None,
+                 result=None):
         super().__init__(message)
         self.error_type = error_type
         self.data = data
         self.error_info = error_info
+        # What a data source answers beside its error, which AppSync still
+        # hands response() as ctx.result: a cancelled transaction's reasons.
+        self.result = result
 
 
 _SDL_TYPE_RE = _re.compile(r"\btype\s+(\w+)\s*(?:implements[^{]*)?\{([^}]*)\}", _re.S)
@@ -2504,7 +2774,7 @@ def _run_js_stage(api_id, unit, args, identity, source, request_headers,
         except _AppSyncResolverError as exc:
             # AppSync hands a data source failure to response() as ctx.error
             # rather than skipping it, so the resolver can map it to its own.
-            result = None
+            result = exc.result
             ds_error = {"message": str(exc), "type": exc.error_type}
 
     ctx = _js_ctx(args, identity, source, request_headers, variables,
@@ -2544,9 +2814,11 @@ def _resolve_appsync_js(api_id, resolver, args, variables, field_name,
                 if not fn:
                     raise _AppSyncResolverError(
                         f"Pipeline function {fn_id} not found", "InvalidResolver")
+                # AWS: every function of a pipeline resolves the resolver's field,
+                # and ctx.info.fieldName names that field, not the function.
                 status, value = _run_js_stage(
                     api_id, fn, args, identity, source, request_headers, variables,
-                    fn.get("name", field_name), type_name, stash, prev, errors)
+                    field_name, type_name, stash, prev, errors)
                 prev = value
                 if status == "earlyReturnEnd":
                     break
