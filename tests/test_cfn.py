@@ -30599,3 +30599,63 @@ def test_cfn_appsync_js_pipeline_resolver_runs_its_code(cfn, appsync):
         cfn.delete_stack(StackName=stack_name)
         _wait_stack(cfn, stack_name)
     assert appsync.list_functions(apiId=api_id)["functions"] == []
+
+
+def test_cfn_appsync_data_source_holds_its_configuration_as_the_api_does(cfn, appsync, ddb):
+    """A data source a template stands holds its configuration in the API's
+    own shape, so a resolver reading through it reaches its table."""
+    import requests as _rq
+    from conftest import ENDPOINT
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-ds-{suffix}"
+    table = f"cfn-appsync-ds-{suffix}"
+    ddb.create_table(
+        TableName=table, KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST")
+    ddb.put_item(TableName=table, Item={"id": {"S": "one"}, "v": {"S": "found"}})
+    api = appsync.create_graphql_api(
+        name=f"ds-api-{suffix}", authenticationType="API_KEY")["graphqlApi"]
+    api_id = api["apiId"]
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Things": {
+                "Type": "AWS::AppSync::DataSource",
+                "Properties": {
+                    "ApiId": api_id, "Name": "Things", "Type": "AMAZON_DYNAMODB",
+                    "DynamoDBConfig": {"TableName": table, "AwsRegion": "us-east-1"},
+                },
+            },
+            "GetThing": {
+                "Type": "AWS::AppSync::Resolver",
+                "DependsOn": "Things",
+                "Properties": {
+                    "ApiId": api_id, "TypeName": "Query", "FieldName": "thing",
+                    "DataSourceName": "Things",
+                    "Runtime": {"Name": "APPSYNC_JS", "RuntimeVersion": "1.0.0"},
+                    "Code": (
+                        "import { util } from '@aws-appsync/utils'\n"
+                        "export function request(ctx) {"
+                        " return { operation: 'GetItem', key: util.dynamodb.toMapValues({ id: 'one' }) } }\n"
+                        "export function response(ctx) { return ctx.result.v }"
+                    ),
+                },
+            },
+        },
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        source = appsync.get_data_source(apiId=api_id, name="Things")["dataSource"]
+        assert source["dynamodbConfig"]["tableName"] == table
+        answer = _rq.post(f"{ENDPOINT.rstrip('/')}/v1/apis/{api_id}/graphql",
+                          headers={"x-api-key": key, "content-type": "application/json"},
+                          json={"query": "{ thing }"}, timeout=15).json()
+        assert answer.get("data", {}).get("thing") == "found", answer
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
