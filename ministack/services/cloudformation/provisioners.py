@@ -6201,12 +6201,48 @@ def _appsync_function_attributes(api_id, function_id, props):
     }
 
 
+def _appsync_runtime(props):
+    """A template's Runtime as the AppSync API holds it."""
+    runtime = props.get("Runtime")
+    if not isinstance(runtime, dict) or not runtime.get("Name"):
+        return None
+    return {"name": runtime["Name"], "runtimeVersion": runtime.get("RuntimeVersion", "1.0.0")}
+
+
+def _appsync_function_body(props):
+    """The function a template declares, in the shape CreateFunction takes."""
+    body = {
+        "name": props.get("Name", ""),
+        "description": props.get("Description", ""),
+        "dataSourceName": props.get("DataSourceName", ""),
+        "requestMappingTemplate": props.get("RequestMappingTemplate", ""),
+        "responseMappingTemplate": props.get("ResponseMappingTemplate", ""),
+        "functionVersion": props.get("FunctionVersion", "2018-05-29"),
+    }
+    runtime = _appsync_runtime(props)
+    if runtime:
+        body["runtime"] = runtime
+    if props.get("Code") is not None:
+        body["code"] = props["Code"]
+    if props.get("MaxBatchSize") is not None:
+        body["maxBatchSize"] = int(props["MaxBatchSize"])
+    return body
+
+
+def _appsync_function_register(api_id, function_id, props):
+    """The function held by the AppSync API, as CreateFunction would hold it,
+    so a pipeline that names it runs its code."""
+    if api_id not in _appsync._apis:
+        raise ValueError(f"GraphQL API {api_id} not found")
+    _appsync._functions.setdefault(api_id, {})[function_id] = _appsync._function_record(
+        api_id, function_id, _appsync_function_body(props))
+
+
 def _appsync_function_create(logical_id, props, stack_name):
     api_id = props.get("ApiId", "")
     function_id = new_uuid().replace("-", "")[:26]
+    _appsync_function_register(api_id, function_id, props)
     attrs = _appsync_function_attributes(api_id, function_id, props)
-    # Pipeline execution remains permissive; the CFN identity and documented
-    # attributes are enough for resolvers to reference the local function.
     return attrs["FunctionArn"], attrs
 
 
@@ -6214,12 +6250,15 @@ def _appsync_function_update(physical_id, old_props, new_props, stack_name):
     if new_props.get("ApiId") != old_props.get("ApiId"):
         return _appsync_function_create(physical_id, new_props, stack_name)
     function_id = physical_id.rsplit("/", 1)[-1]
+    _appsync_function_register(new_props.get("ApiId", ""), function_id, new_props)
     attrs = _appsync_function_attributes(new_props.get("ApiId", ""), function_id, new_props)
     return physical_id, attrs
 
 
 def _appsync_function_delete(physical_id, props):
-    pass
+    api_id = props.get("ApiId", "")
+    function_id = physical_id.rsplit("/", 1)[-1]
+    (_appsync._functions.get(api_id) or {}).pop(function_id, None)
 
 
 def _appsync_resolver_create(logical_id, props, stack_name):
@@ -6231,11 +6270,25 @@ def _appsync_resolver_create(logical_id, props, stack_name):
         "typeName": type_name, "fieldName": field_name,
         "dataSourceName": ds_name,
         "resolverArn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/types/{type_name}/resolvers/{field_name}",
+        # What CreateResolver holds, so the resolver runs as one made through
+        # the API does: a JS resolver's runtime and code, a pipeline's kind
+        # and functions.
+        "kind": props.get("Kind", "UNIT"),
     }
     if props.get("RequestMappingTemplate"):
         resolver["requestMappingTemplate"] = props["RequestMappingTemplate"]
     if props.get("ResponseMappingTemplate"):
         resolver["responseMappingTemplate"] = props["ResponseMappingTemplate"]
+    runtime = _appsync_runtime(props)
+    if runtime:
+        resolver["runtime"] = runtime
+    if props.get("Code") is not None:
+        resolver["code"] = props["Code"]
+    pipeline = props.get("PipelineConfig")
+    if isinstance(pipeline, dict):
+        resolver["pipelineConfig"] = {"functions": list(pipeline.get("Functions") or [])}
+    if props.get("MaxBatchSize") is not None:
+        resolver["maxBatchSize"] = int(props["MaxBatchSize"])
     _appsync._resolvers.setdefault(api_id, {}).setdefault(type_name, {})[field_name] = resolver
     return f"{api_id}/{type_name}/{field_name}", {"ResolverArn": resolver["resolverArn"]}
 
