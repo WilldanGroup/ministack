@@ -3655,6 +3655,135 @@ class TestKmsKeyNamedByAlias:
         assert status == 200, body
         assert world.named("alias/probe-a") == new
 
+class TestCloudFormationStackResourceTags:
+    """A check against a stack carries the stack's tags as the
+    aws:ResourceTag/<key> condition keys, so a statement bounded by a tag the
+    stack carries admits a call on it, and one bounded by a tag it lacks, or
+    by any tag of a stack that does not stand, refuses it. Before, no
+    CloudFormation condition key was supplied and every tag-bounded grant on
+    a stack refused, the way AWS refuses one on an untagged stack."""
+
+    _ACCOUNT = "000000000000"
+    _REGION = "us-east-1"
+    _ROLE = "cfn-resource-tag-probe"
+    _SESSION = "ASIACFNRESOURCETAG01"
+
+    @staticmethod
+    def _dispatch(access_key, action, params):
+        import urllib.parse
+
+        import ministack.app as app
+
+        headers = {
+            "host": "localhost",
+            "content-type": "application/x-www-form-urlencoded",
+            "authorization": (
+                f"AWS4-HMAC-SHA256 Credential={access_key}/20260101/us-east-1/cloudformation"
+                "/aws4_request, SignedHeaders=host, Signature=deadbeef"
+            ),
+        }
+        body = urllib.parse.urlencode(
+            {"Action": action, "Version": "2010-05-15", **params}).encode()
+        return asyncio.run(app._dispatch_service_request(
+            "POST", "/", headers, body, {}, "req-1"))
+
+    @pytest.fixture
+    def world(self, monkeypatch):
+        """Stacks made as root, and one role's session to call as."""
+        import types
+
+        import ministack.app as app
+        from ministack.services import iam as iam_svc
+        from ministack.services import sts as sts_svc
+        from ministack.services.cloudformation import _stacks
+
+        monkeypatch.setattr(app, "AUTH", True)
+        names = []
+
+        def stack(name, tags):
+            template = {"Resources": {"Topic": {"Type": "AWS::SNS::Topic"}}}
+            params = {"StackName": name, "TemplateBody": json.dumps(template)}
+            for index, (key, value) in enumerate(tags.items(), start=1):
+                params[f"Tags.member.{index}.Key"] = key
+                params[f"Tags.member.{index}.Value"] = value
+            status, _, body = self._dispatch("test", "CreateStack", params)
+            assert status == 200, body
+            names.append(name)
+
+        def role(statements):
+            iam_svc._roles[self._ROLE] = {
+                "RoleName": self._ROLE,
+                "Arn": f"arn:aws:iam::{self._ACCOUNT}:role/{self._ROLE}",
+                "RoleId": "AROACFNRESOURCETAG", "CreateDate": "2026-01-01", "Path": "/",
+                "AssumeRolePolicyDocument": "{}", "AttachedPolicies": [], "Tags": [],
+                "InlinePolicies": {"stacks": json.dumps({"Statement": statements})},
+            }
+            sts_svc.register_session(self._SESSION, {
+                "Arn": f"arn:aws:sts::{self._ACCOUNT}:assumed-role/{self._ROLE}/probe",
+                "UserId": "AROACFNRESOURCETAG:probe",
+                "SecretAccessKey": "s", "SessionToken": "t",
+                "Expiration": time.time() + 3600,
+                "AccountId": self._ACCOUNT, "PrincipalType": "AssumedRole",
+                "SourceAccessKeyId": "test",
+                "SourcePrincipalArn": f"arn:aws:iam::{self._ACCOUNT}:root",
+            })
+            return self._SESSION
+
+        try:
+            yield types.SimpleNamespace(stack=stack, role=role)
+        finally:
+            sts_svc._sessions.pop(self._SESSION, None)
+            iam_svc._roles.pop(self._ROLE, None)
+            for name in names:
+                _stacks.pop(name, None)
+
+    def _tagged(self, action):
+        """``action`` on any stack of the account that carries ``swb:tenant``."""
+        return {
+            "Effect": "Allow", "Action": action,
+            "Resource": f"arn:aws:cloudformation:*:{self._ACCOUNT}:stack/*",
+            "Condition": {"StringLike": {"aws:ResourceTag/swb:tenant": "*"}},
+        }
+
+    def test_a_tag_bounded_grant_admits_a_stack_carrying_the_tag(self, world):
+        world.stack("cfn-tag-owned", {"swb:tenant": "acme"})
+        session = world.role([self._tagged("cloudformation:DescribeStacks")])
+
+        status, _, body = self._dispatch(session, "DescribeStacks", {"StackName": "cfn-tag-owned"})
+        assert status == 200, body
+        assert b"cfn-tag-owned" in body
+
+    def test_a_tag_bounded_grant_refuses_a_stack_without_the_tag(self, world):
+        world.stack("cfn-tag-foreign", {"owner": "someone-else"})
+        session = world.role([self._tagged("cloudformation:DescribeStacks")])
+
+        status, _, body = self._dispatch(
+            session, "DescribeStacks", {"StackName": "cfn-tag-foreign"})
+        assert status == 403, body
+        assert b"AccessDenied" in body and b"cloudformation:DescribeStacks" in body
+
+    def test_a_tag_bounded_grant_refuses_a_stack_that_does_not_stand(self, world):
+        session = world.role([self._tagged("cloudformation:DescribeStacks")])
+
+        status, _, body = self._dispatch(
+            session, "DescribeStacks", {"StackName": "cfn-tag-absent"})
+        assert status == 403, body
+
+    def test_a_grant_on_the_tag_value_reads_the_stack_named_by_its_id(self, world):
+        from ministack.services.cloudformation import _stacks
+
+        world.stack("cfn-tag-by-id", {"swb:tenant": "acme"})
+        stack_id = _stacks.get_scoped(self._ACCOUNT, self._REGION, "cfn-tag-by-id")["StackId"]
+        session = world.role([{
+            "Effect": "Allow", "Action": "cloudformation:DescribeStacks",
+            "Resource": f"arn:aws:cloudformation:*:{self._ACCOUNT}:stack/*",
+            "Condition": {"StringEquals": {"aws:ResourceTag/swb:tenant": "acme"}},
+        }])
+
+        status, _, body = self._dispatch(session, "DescribeStacks", {"StackName": stack_id})
+        assert status == 200, body
+
+
 def test_lambda_create_function_with_a_missing_role_answers_400(monkeypatch):
     """The role check must reach the client, not blow up inside _build_config."""
     import io
