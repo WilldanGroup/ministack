@@ -574,14 +574,18 @@ def _resolve_parameters(template: dict, provided_params: list[dict],
                 except ValueError:
                     raise ValueError(
                         f"Parameter '{name}' value '{value}' is not a valid List<Number>")
-        elif ptype == "CommaDelimitedList":
-            # Keep as string; Fn::Select will split
-            pass
         # AWS-specific types treated as String -- no extra validation
 
         _check_parameter_constraints(name, defn, ptype, value)
 
         out = {"Value": value, "NoEcho": no_echo}
+        # A list-typed parameter is a list where a template refers to it: Ref
+        # of a CommaDelimitedList or a List<...> is its members, each space
+        # trimmed, as CloudFormation hands them to a function or a resource
+        # property. The string stays the parameter's value, which is what
+        # DescribeStacks reports and what Fn::Sub may not take.
+        if _rule_inner_type(ptype)[1]:
+            out["Members"] = [member.strip() for member in str(value).split(",")]
         if ssm_name is not None:
             # Persisted so a later UpdateStack with UsePreviousValue re-resolves
             # the SSM name instead of reusing this now-stale resolved value.
@@ -1074,7 +1078,7 @@ def _resolve_refs(value, resources, params, conditions, mappings,
         if ref in pseudo:
             return pseudo[ref]
         if ref in params:
-            return params[ref]["Value"]
+            return params[ref].get("Members", params[ref]["Value"])
         # Resource physical ID
         if ref in resources and "PhysicalResourceId" in resources[ref]:
             return resources[ref]["PhysicalResourceId"]

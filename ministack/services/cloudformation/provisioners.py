@@ -4115,8 +4115,12 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
 
     raw_param_props = props.get("Parameters") or {}
     if isinstance(raw_param_props, dict):
+        # A list a parent hands a child — a Ref of its own list parameter —
+        # reaches the child's parameter as the comma-delimited string a
+        # parameter value is.
         provided_params = [
-            {"Key": k, "Value": "" if v is None else str(v)}
+            {"Key": k, "Value": "" if v is None
+             else ",".join(str(m) for m in v) if isinstance(v, list) else str(v)}
             for k, v in raw_param_props.items()
         ]
     else:
