@@ -2629,3 +2629,256 @@ def test_appsync_cfn_schema_lands_in_the_schema_store():
     assert _appsync._schemas.get(api_id) is None
 
     _appsync._delete_graphql_api(api_id)
+
+
+# ---------------------------------------------------------------------------
+# A JS resolver's DynamoDB request, run as AppSync runs it: the operation the
+# request names, with its key condition, index, filter, limit, update,
+# condition and paging, and the result in AppSync's shape.
+# ---------------------------------------------------------------------------
+
+def _single_table_api(appsync, ddb, name):
+    """A PK/SK table with a GSI, as single-table designs have, behind one data source."""
+    api = appsync.create_graphql_api(name=name, authenticationType="API_KEY")["graphqlApi"]
+    api_id = api["apiId"]
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+    table = f"{name}-table"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"},
+                   {"AttributeName": "SK", "KeyType": "RANGE"}],
+        AttributeDefinitions=[{"AttributeName": n, "AttributeType": "S"}
+                              for n in ("PK", "SK", "GSI1PK", "GSI1SK")],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "GSI1",
+            "KeySchema": [{"AttributeName": "GSI1PK", "KeyType": "HASH"},
+                          {"AttributeName": "GSI1SK", "KeyType": "RANGE"}],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    appsync.create_data_source(
+        apiId=api_id, name="Table", type="AMAZON_DYNAMODB",
+        dynamodbConfig={"tableName": table, "awsRegion": "us-east-1"},
+    )
+    return api_id, key, table
+
+
+def _ddb_js_resolver(appsync, api_id, field, code):
+    appsync.create_resolver(
+        apiId=api_id, typeName="Query", fieldName=field, dataSourceName="Table",
+        runtime={"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"}, code=code)
+
+
+def _row(pk, sk, **attrs):
+    item = {"PK": {"S": pk}, "SK": {"S": sk}}
+    item.update({k: {"S": v} for k, v in attrs.items()})
+    return item
+
+
+def test_appsync_js_pipeline_function_sees_the_fields_name(appsync):
+    """In a pipeline, ctx.info.fieldName is the field being resolved, in the
+    resolver and in every function — not the function's own name, which a
+    function that serves several fields would otherwise switch on."""
+    api_id, key = _js_api(appsync, "qa-js-fieldname")
+    fn = appsync.create_function(
+        apiId=api_id, name="readsTheField", dataSourceName="DS",
+        runtime={"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"},
+        code="""
+            export function request(ctx) { return { payload: ctx.info.fieldName } }
+            export function response(ctx) { return ctx.result }
+        """)["functionConfiguration"]["functionId"]
+    appsync.create_resolver(
+        apiId=api_id, typeName="Query", fieldName="tenants", kind="PIPELINE",
+        runtime={"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"},
+        pipelineConfig={"functions": [fn]},
+        code="""
+            export function request(ctx) { return {} }
+            export function response(ctx) { return ctx.prev.result }
+        """)
+    assert _graphql(api_id, key, "{ tenants }")["data"]["tenants"] == "tenants"
+
+
+def test_appsync_js_dynamodb_query_reads_its_key_condition_on_its_index(appsync, ddb):
+    """A Query reads the rows its key condition names, on the index it names,
+    filtered, limited and paged — not the whole table."""
+    api_id, key, table = _single_table_api(appsync, ddb, "qa-js-query")
+    ddb.put_item(TableName=table, Item=_row("platform", "fleet#build"))
+    for n in ("a", "b", "c"):
+        ddb.put_item(TableName=table, Item=_row(
+            f"tenant#{n}", f"tenant#{n}", GSI1PK="type#tenant", GSI1SK=n, name=f"T{n}"))
+    ddb.put_item(TableName=table, Item=_row(
+        "tenant#x", "connection#1", GSI1PK="type#connection", GSI1SK="1"))
+    _ddb_js_resolver(appsync, api_id, "tenants", """
+        import { util } from '@aws-appsync/utils'
+        export function request(ctx) {
+          return {
+            operation: 'Query',
+            index: 'GSI1',
+            query: {
+              expression: '#pk = :pk',
+              expressionNames: { '#pk': 'GSI1PK' },
+              expressionValues: util.dynamodb.toMapValues({ ':pk': 'type#tenant' }),
+            },
+            filter: {
+              expression: '#n <> :skip',
+              expressionNames: { '#n': 'name' },
+              expressionValues: util.dynamodb.toMapValues({ ':skip': 'Tb' }),
+            },
+            limit: ctx.args.limit,
+            nextToken: ctx.args.after,
+          }
+        }
+        export function response(ctx) {
+          if (ctx.error) util.error(ctx.error.message, ctx.error.type)
+          return { names: ctx.result.items.map((i) => i.name), next: ctx.result.nextToken }
+        }
+    """)
+    whole = _graphql(api_id, key, "{ tenants(limit: 10) }")["data"]["tenants"]
+    assert whole == {"names": ["Ta", "Tc"], "next": None}
+    first = _graphql(api_id, key, "{ tenants(limit: 1) }")["data"]["tenants"]
+    assert first["names"] == ["Ta"] and first["next"]
+    rest = _graphql(api_id, key, '{ tenants(limit: 5, after: "%s") }' % first["next"])
+    assert rest["data"]["tenants"] == {"names": ["Tc"], "next": None}
+
+
+def test_appsync_js_dynamodb_update_runs_its_expression_under_its_condition(appsync, ddb):
+    """An UpdateItem runs its update expression, answers the item as it now
+    stands, and is refused as AppSync refuses it when its condition fails."""
+    api_id, key, table = _single_table_api(appsync, ddb, "qa-js-update")
+    ddb.put_item(TableName=table, Item={**_row("tenant#a", "tenant#a", status="pending"),
+                                        "count": {"N": "1"}})
+    _ddb_js_resolver(appsync, api_id, "activate", """
+        import { util } from '@aws-appsync/utils'
+        export function request(ctx) {
+          return {
+            operation: 'UpdateItem',
+            key: util.dynamodb.toMapValues({ PK: 'tenant#a', SK: 'tenant#a' }),
+            update: {
+              expression: 'SET #s = :to ADD #c :one',
+              expressionNames: { '#s': 'status', '#c': 'count' },
+              expressionValues: util.dynamodb.toMapValues({ ':to': 'active', ':one': 1 }),
+            },
+            condition: {
+              expression: '#s = :from',
+              expressionNames: { '#s': 'status' },
+              expressionValues: util.dynamodb.toMapValues({ ':from': ctx.args.from }),
+            },
+          }
+        }
+        export function response(ctx) {
+          if (ctx.error) util.error(ctx.error.message, ctx.error.type)
+          return { status: ctx.result.status, count: ctx.result.count, pk: ctx.result.PK }
+        }
+    """)
+    done = _graphql(api_id, key, '{ activate(from: "pending") }')
+    assert done["data"]["activate"] == {"status": "active", "count": 2, "pk": "tenant#a"}
+    refused = _graphql(api_id, key, '{ activate(from: "pending") }')
+    assert refused["errors"][0]["errorType"] == "DynamoDB:ConditionalCheckFailedException"
+    stored = ddb.get_item(TableName=table, Key={"PK": {"S": "tenant#a"}, "SK": {"S": "tenant#a"}})
+    assert stored["Item"]["count"] == {"N": "2"}
+
+
+def test_appsync_js_dynamodb_conditional_put_and_delete(appsync, ddb):
+    """A PutItem under attribute_not_exists writes once and is refused after;
+    a DeleteItem answers the item it removed."""
+    api_id, key, table = _single_table_api(appsync, ddb, "qa-js-put")
+    _ddb_js_resolver(appsync, api_id, "claim", """
+        import { util } from '@aws-appsync/utils'
+        export function request(ctx) {
+          return {
+            operation: 'PutItem',
+            key: util.dynamodb.toMapValues({ PK: 'claim#1', SK: 'claim#1' }),
+            attributeValues: util.dynamodb.toMapValues({ by: ctx.args.by }),
+            condition: { expression: 'attribute_not_exists(PK)' },
+          }
+        }
+        export function response(ctx) {
+          if (ctx.error) util.error(ctx.error.message, ctx.error.type)
+          return ctx.result.by
+        }
+    """)
+    _ddb_js_resolver(appsync, api_id, "release", """
+        import { util } from '@aws-appsync/utils'
+        export function request(ctx) {
+          return { operation: 'DeleteItem',
+                   key: util.dynamodb.toMapValues({ PK: 'claim#1', SK: 'claim#1' }) }
+        }
+        export function response(ctx) { return ctx.result ? ctx.result.by : null }
+    """)
+    assert _graphql(api_id, key, '{ claim(by: "one") }')["data"]["claim"] == "one"
+    refused = _graphql(api_id, key, '{ claim(by: "two") }')
+    assert refused["errors"][0]["errorType"] == "DynamoDB:ConditionalCheckFailedException"
+    # The same write again is the state it wanted, which AppSync answers as done.
+    assert _graphql(api_id, key, '{ claim(by: "one") }')["data"]["claim"] == "one"
+    assert _graphql(api_id, key, "{ release }")["data"]["release"] == "one"
+    assert _graphql(api_id, key, "{ release }")["data"]["release"] is None
+
+
+def test_appsync_js_dynamodb_batch_get_answers_in_key_order_with_nulls(appsync, ddb):
+    """A BatchGetItem answers each table's items in the order its keys were
+    asked, a null where a key holds no item."""
+    api_id, key, table = _single_table_api(appsync, ddb, "qa-js-batch")
+    ddb.put_item(TableName=table, Item=_row("tenant#a", "tenant#a", name="A"))
+    ddb.put_item(TableName=table, Item=_row("tenant#c", "tenant#c", name="C"))
+    _ddb_js_resolver(appsync, api_id, "names", """
+        const TABLE = '%s'
+
+        import { util } from '@aws-appsync/utils'
+        export function request(ctx) {
+          const keys = ['c', 'b', 'a'].map((n) =>
+            util.dynamodb.toMapValues({ PK: 'tenant#' + n, SK: 'tenant#' + n }))
+          return { operation: 'BatchGetItem', tables: { [TABLE]: { keys } } }
+        }
+        export function response(ctx) {
+          if (ctx.error) util.error(ctx.error.message, ctx.error.type)
+          return ctx.result.data[TABLE].map((i) => (i ? i.name : null))
+        }
+    """ % table)
+    assert _graphql(api_id, key, "{ names }")["data"]["names"] == ["C", None, "A"]
+
+
+def test_appsync_js_dynamodb_transaction_is_all_or_nothing(appsync, ddb):
+    """A TransactWriteItems writes every item or none, answering their keys,
+    and a failed condition cancels it with AppSync's reasons in ctx.result."""
+    api_id, key, table = _single_table_api(appsync, ddb, "qa-js-tx")
+    ddb.put_item(TableName=table, Item=_row("tenant#a", "grant#1", status="pending"))
+    _ddb_js_resolver(appsync, api_id, "accept", """
+        const TABLE = '%s'
+
+        import { util } from '@aws-appsync/utils'
+        export function request(ctx) {
+          return {
+            operation: 'TransactWriteItems',
+            transactItems: [
+              {
+                table: TABLE, operation: 'UpdateItem',
+                key: util.dynamodb.toMapValues({ PK: 'tenant#a', SK: 'grant#1' }),
+                update: { expression: 'SET #s = :a', expressionNames: { '#s': 'status' },
+                          expressionValues: util.dynamodb.toMapValues({ ':a': 'active' }) },
+                condition: { expression: '#s = :p', expressionNames: { '#s': 'status' },
+                             expressionValues: util.dynamodb.toMapValues({ ':p': 'pending' }) },
+              },
+              {
+                table: TABLE, operation: 'PutItem',
+                key: util.dynamodb.toMapValues({ PK: 'tenant#a', SK: 'accepted#' + ctx.args.n }),
+                attributeValues: util.dynamodb.toMapValues({ n: ctx.args.n }),
+              },
+            ],
+          }
+        }
+        export function response(ctx) {
+          if (ctx.error) {
+            return { error: ctx.error.type,
+                     reasons: ctx.result.cancellationReasons.map((r) => r.type) }
+          }
+          return { keys: ctx.result.keys.map((k) => k.SK) }
+        }
+    """ % table)
+    assert _graphql(api_id, key, "{ accept(n: 1) }")["data"]["accept"] == {
+        "keys": ["grant#1", "accepted#1"]}
+    again = _graphql(api_id, key, "{ accept(n: 2) }")["data"]["accept"]
+    assert again == {"error": "DynamoDB:TransactionCanceledException",
+                     "reasons": ["ConditionalCheckFailed", "None"]}
+    assert "Item" not in ddb.get_item(
+        TableName=table, Key={"PK": {"S": "tenant#a"}, "SK": {"S": "accepted#2"}})
