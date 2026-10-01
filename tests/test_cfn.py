@@ -30523,3 +30523,79 @@ def test_describe_stack_resource_drifts_pagination(cfn):
         assert exc.value.response["Error"]["Code"] == "ValidationError"
     finally:
         _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_appsync_js_pipeline_resolver_runs_its_code(cfn, appsync):
+    """A JS pipeline resolver a template stands runs as one made through the
+    AppSync API does: its functions are the API's, with their runtime and
+    code, and the resolver keeps its kind, runtime, code and pipeline — on
+    create and on update."""
+    import requests as _rq
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-js-{suffix}"
+    api = appsync.create_graphql_api(
+        name=f"js-pipeline-api-{suffix}", authenticationType="API_KEY")["graphqlApi"]
+    api_id = api["apiId"]
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+    appsync.create_data_source(apiId=api_id, name="NoneSource", type="NONE")
+    runtime = {"Name": "APPSYNC_JS", "RuntimeVersion": "1.0.0"}
+
+    def template(greeting):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Greet": {
+                    "Type": "AWS::AppSync::FunctionConfiguration",
+                    "Properties": {
+                        "ApiId": api_id, "DataSourceName": "NoneSource", "Name": "greet",
+                        "Runtime": runtime,
+                        "Code": (
+                            "export function request(ctx) {"
+                            f" return {{ payload: '{greeting}, ' + ctx.info.fieldName }} }}\n"
+                            "export function response(ctx) { return ctx.result }"
+                        ),
+                    },
+                },
+                "Hello": {
+                    "Type": "AWS::AppSync::Resolver",
+                    "Properties": {
+                        "ApiId": api_id, "TypeName": "Query", "FieldName": "hello",
+                        "Kind": "PIPELINE", "Runtime": runtime,
+                        "PipelineConfig": {"Functions": [{"Fn::GetAtt": ["Greet", "FunctionId"]}]},
+                        "Code": (
+                            "export function request(ctx) { return {} }\n"
+                            "export function response(ctx) { return ctx.prev.result }"
+                        ),
+                    },
+                },
+            },
+        }
+
+    def hello():
+        from conftest import ENDPOINT
+        answer = _rq.post(f"{ENDPOINT.rstrip('/')}/v1/apis/{api_id}/graphql",
+                          headers={"x-api-key": key, "content-type": "application/json"},
+                          json={"query": "{ hello }"}, timeout=15).json()
+        return answer.get("data", {}).get("hello")
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template("hello")))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert hello() == "hello, hello"
+        functions = appsync.list_functions(apiId=api_id)["functions"]
+        assert [f["name"] for f in functions] == ["greet"]
+        assert functions[0]["runtime"] == {"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"}
+        resolver = appsync.get_resolver(apiId=api_id, typeName="Query", fieldName="hello")["resolver"]
+        assert resolver["kind"] == "PIPELINE"
+        assert resolver["pipelineConfig"] == {"functions": [functions[0]["functionId"]]}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template("hi")))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert hello() == "hi, hello"
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+    assert appsync.list_functions(apiId=api_id)["functions"] == []
