@@ -1411,6 +1411,59 @@ def test_cfn_stack_with_parameters(cfn, sqs):
     assert any("cfn-t02-custom" in u for u in urls)
 
 
+def test_cfn_list_parameter_ref_is_its_members(cfn, s3):
+    """Ref of a CommaDelimitedList is its members, each space trimmed ("An
+    array of literal strings that are separated by commas ... Each member
+    string is space trimmed", parameters-section-structure): Fn::Join and
+    Fn::Select read members, not characters; a child stack handed the list
+    takes it as its comma-delimited parameter; and an Output of the bare list
+    is refused, as CloudFormation refuses any Output that is not a string."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    bucket = f"cfn-list-ref-{uid}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="child.json", Body=json.dumps({
+        "Parameters": {"Names": {"Type": "CommaDelimitedList"}},
+        "Resources": {},
+        "Outputs": {"Second": {"Value": {"Fn::Select": [1, {"Ref": "Names"}]}}},
+    }).encode())
+    template = {
+        "Parameters": {"Names": {"Type": "CommaDelimitedList"}},
+        "Resources": {"Child": {"Type": "AWS::CloudFormation::Stack", "Properties": {
+            "TemplateURL": f"{endpoint}/{bucket}/child.json",
+            "Parameters": {"Names": {"Ref": "Names"}},
+        }}},
+        "Outputs": {
+            "Joined": {"Value": {"Fn::Join": ["|", {"Ref": "Names"}]}},
+            "Second": {"Value": {"Fn::Select": [1, {"Ref": "Names"}]}},
+            "ChildSecond": {"Value": {"Fn::GetAtt": ["Child", "Outputs.Second"]}},
+        },
+    }
+    name = f"cfn-list-ref-{uid}"
+    names = [{"ParameterKey": "Names", "ParameterValue": "role-a, role b ,role-c"}]
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps(template), Parameters=names)
+    _wait_stack(cfn, name)
+    stack = cfn.describe_stacks(StackName=name)["Stacks"][0]
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    assert outputs == {"Joined": "role-a|role b|role-c", "Second": "role b",
+                       "ChildSecond": "role b"}
+    assert stack["Parameters"] == names
+
+    bare = f"cfn-list-ref-bare-{uid}"
+    cfn.create_stack(StackName=bare, TemplateBody=json.dumps({
+        "Parameters": {"Names": {"Type": "CommaDelimitedList"}},
+        "Resources": {"Topic": {"Type": "AWS::SNS::Topic"}},
+        "Outputs": {"Names": {"Value": {"Ref": "Names"}}},
+    }), Parameters=names)
+    _wait_stack(cfn, bare)
+    refused = cfn.describe_stacks(StackName=bare)["Stacks"][0]
+    assert refused["StackStatus"] in ("CREATE_FAILED", "ROLLBACK_COMPLETE")
+    reasons = [event.get("ResourceStatusReason", "")
+               for event in cfn.describe_stack_events(StackName=bare)["StackEvents"]]
+    assert any("must evaluate to a String" in reason for reason in reasons)
+
+
 def test_cfn_parameter_constraints_are_enforced(cfn):
     """AllowedPattern, MinLength, MaxLength, MinValue and MaxValue are checked
     before a stack exists, with CloudFormation's message (measured:
