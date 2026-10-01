@@ -1,6 +1,8 @@
+import base64
 import io
 import json
 import os
+import time
 import urllib.request
 import uuid as _uuid_mod
 import zipfile
@@ -1644,6 +1646,141 @@ def test_appsync_js_identity_comes_from_a_cognito_token(appsync, cognito_idp):
                             "content-type": "application/json"},
                    json={"query": "{ whoami }"}, timeout=15).json()
     assert out["data"]["whoami"]["sub"], "ctx.identity.sub must be populated"
+
+
+class TestAppSyncOidcVerification:
+    """Under AUTH an OPENID_CONNECT provider admits a bearer token only once
+    it verifies as AppSync verifies it — the issuer's JWKS signature, iss, the
+    expiry and the clientId against aud — and the resolvers see the caller:
+    ctx.identity carries the token's claims, issuer and sub. Before, any bearer
+    was admitted unverified and the resolvers saw no identity at all, so an API
+    that authorizes on its caller's claims answered nobody, and a wrong issuer
+    on the API was green locally."""
+
+    _SDL = """
+    type Who { sub: String tenant: String issuer: String }
+    type Query { whoami: Who }
+    schema { query: Query }
+    """
+
+    @pytest.fixture
+    def world(self, monkeypatch):
+        import http.server
+        import threading
+        import types
+
+        import ministack.app as app
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding, rsa
+        from ministack.services import appsync as appsync_svc
+
+        monkeypatch.setattr(app, "AUTH", True)
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        stranger = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+        def b64(raw):
+            return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+        numbers = key.public_key().public_numbers()
+        jwk = {"kty": "RSA", "kid": "k1", "alg": "RS256", "use": "sig",
+               "n": b64(numbers.n.to_bytes((numbers.n.bit_length() + 7) // 8, "big")),
+               "e": b64(numbers.e.to_bytes(3, "big"))}
+        documents = {}
+
+        class Issuer(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps(documents.get(self.path, {})).encode()
+                self.send_response(200 if self.path in documents else 404)
+                self.send_header("content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Issuer)
+        issuer = f"http://127.0.0.1:{server.server_address[1]}"
+        documents["/.well-known/openid-configuration"] = {"issuer": issuer,
+                                                          "jwks_uri": f"{issuer}/jwks"}
+        documents["/jwks"] = {"keys": [jwk]}
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        def token(signer=key, **over):
+            now = int(time.time())
+            claims = {"iss": issuer, "sub": "person-1", "aud": "app-1",
+                      "tenantId": "acct-1", "iat": now, "exp": now + 600, **over}
+            unsigned = (b64(json.dumps({"alg": "RS256", "kid": "k1", "typ": "JWT"}).encode())
+                        + "." + b64(json.dumps(claims).encode()))
+            signature = signer.sign(unsigned.encode(), padding.PKCS1v15(), hashes.SHA256())
+            return f"{unsigned}.{b64(signature)}"
+
+        status, _, body = appsync_svc._create_graphql_api({
+            "name": "oidc-verification",
+            "authenticationType": "AWS_IAM",
+            "additionalAuthenticationProviders": [{
+                "authenticationType": "OPENID_CONNECT",
+                "openIDConnectConfig": {"issuer": issuer, "clientId": "app-.*"},
+            }],
+        })
+        assert status == 200, body
+        api_id = json.loads(body)["graphqlApi"]["apiId"]
+        appsync_svc._start_schema_creation(api_id, {"definition": self._SDL})
+        appsync_svc._create_data_source(api_id, {"name": "DS", "type": "NONE"})
+        appsync_svc._create_resolver(api_id, "Query", {
+            "fieldName": "whoami", "dataSourceName": "DS",
+            "runtime": {"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"},
+            "code": """
+                export function request(ctx) {
+                  return { payload: { sub: ctx.identity.sub,
+                                      tenant: ctx.identity.claims.tenantId,
+                                      issuer: ctx.identity.issuer } }
+                }
+                export function response(ctx) { return ctx.result }
+            """,
+        })
+
+        def ask(bearer):
+            status, _, body = appsync_svc._execute_graphql(
+                api_id, {"query": "{ whoami { sub tenant issuer } }"},
+                {"authorization": f"Bearer {bearer}"})
+            return status, json.loads(body)
+
+        try:
+            yield types.SimpleNamespace(ask=ask, token=token, stranger=stranger,
+                                        issuer=issuer, serialization=serialization)
+        finally:
+            server.shutdown()
+            appsync_svc._apis.pop(api_id, None)
+
+    def test_a_token_the_issuer_signed_is_admitted_and_the_resolver_sees_the_caller(self, world):
+        status, out = world.ask(world.token())
+        assert status == 200, out
+        assert out["data"]["whoami"] == {"sub": "person-1", "tenant": "acct-1",
+                                         "issuer": world.issuer}
+
+    def test_a_token_another_key_signed_is_refused(self, world):
+        status, out = world.ask(world.token(signer=world.stranger))
+        assert status == 401, out
+        assert out["errors"][0]["errorType"] == "UnauthorizedException"
+
+    def test_a_token_from_another_issuer_is_refused(self, world):
+        status, _ = world.ask(world.token(iss="https://elsewhere.example"))
+        assert status == 401
+
+    def test_a_token_for_another_client_is_refused(self, world):
+        status, _ = world.ask(world.token(aud="someone-else"))
+        assert status == 401
+
+    def test_an_expired_token_is_refused(self, world):
+        status, _ = world.ask(world.token(exp=int(time.time()) - 60))
+        assert status == 401
+
+    def test_without_auth_a_bearer_is_read_unverified(self, world, monkeypatch):
+        import ministack.app as app
+        monkeypatch.setattr(app, "AUTH", False)
+        status, out = world.ask(world.token(signer=world.stranger))
+        assert status == 200, out
+        assert out["data"]["whoami"]["sub"] == "person-1"
 
 
 def test_appsync_js_ctx_error_is_visible_to_response(appsync):
