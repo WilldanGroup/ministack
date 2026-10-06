@@ -295,3 +295,44 @@ def test_an_unknown_operation_is_named(home):
     with pytest.raises(ClientError) as unknown:
         home.describe_stack_set_operation(StackSetName=name, OperationId="no-such-operation")
     assert unknown.value.response["Error"]["Code"] == "OperationNotFoundException"
+
+
+def test_a_template_past_the_inline_limit_stands_its_instance(home, away):
+    """A StackSet created from a TemplateURL holds a template up to the size
+    that admits, and stands its instances from it: the inline TemplateBody
+    limit is a request's, not the service's own operation's."""
+    name = _set_name()
+    big = json.loads(_template())
+    big["Description"] = "x" * 1000
+    for i in range(60):
+        big["Resources"][f"Queue{i}"] = {
+            "Type": "AWS::SQS::Queue",
+            "Metadata": {"Padding": "p" * 1000},
+        }
+    body = json.dumps(big)
+    assert len(body) > 51200
+    s3 = _client("s3", HOME)
+    bucket = f"stackset-templates-{uuid.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="big.json", Body=body.encode())
+    home.create_stack_set(
+        StackSetName=name,
+        TemplateURL=f"{ENDPOINT}/{bucket}/big.json",
+        Parameters=[{"ParameterKey": "Label", "ParameterValue": "big"}],
+    )
+    op = home.create_stack_instances(StackSetName=name, Accounts=[ACCOUNT], Regions=[AWAY])
+    ended = _wait(home, name, op["OperationId"], timeout=60)
+    assert ended["Status"] == "SUCCEEDED", ended.get("StatusReason")
+    stack, _ = _instance_stack(home, away, name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+
+def test_a_failed_instance_names_its_reason_once_unescaped(home):
+    name = _set_name()
+    home.create_stack_set(StackSetName=name, TemplateBody=_template())
+    op = home.create_stack_instances(StackSetName=name, Accounts=[ACCOUNT], Regions=[AWAY])
+    _wait(home, name, op["OperationId"])
+    results = home.list_stack_set_operation_results(
+        StackSetName=name, OperationId=op["OperationId"])["Summaries"]
+    assert "&#" not in results[0]["StatusReason"]
+    assert "&amp;" not in results[0]["StatusReason"]

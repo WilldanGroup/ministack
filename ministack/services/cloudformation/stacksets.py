@@ -28,6 +28,7 @@ Supports: CreateStackSet, UpdateStackSet, DeleteStackSet, DescribeStackSet,
 """
 
 import re
+from html import unescape
 
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -46,6 +47,7 @@ from .helpers import (
     _p,
     _resolve_template,
     _xml,
+    service_operation,
 )
 
 _stack_sets = AccountRegionScopedDict()   # stack set name -> stack set dict
@@ -134,7 +136,7 @@ def _error_message(response):
     """The message of an error response one of the stack handlers returned."""
     body = response[2].decode("utf-8", errors="replace")
     found = re.search(r"<Message>(.*?)</Message>", body, re.S)
-    return found.group(1) if found else body
+    return unescape(found.group(1)) if found else body
 
 
 def _instance_parameters(stack_set, instance):
@@ -165,9 +167,19 @@ def _stack_request(stack_set, instance, stack_name, update=False):
 def _operate(stack_set, instance, action):
     """Start one instance's stack operation in its region; the result it
     starts as: RUNNING, or already SUCCEEDED or FAILED with the reason."""
+    account, region = instance["Account"], instance["Region"]
+    # The instance's operation is the service's own, carrying the StackSet's
+    # template whatever its size, never a request's inline body.
+    token = service_operation.set(True)
+    try:
+        return _operate_in(stack_set, instance, action, account, region)
+    finally:
+        service_operation.reset(token)
+
+
+def _operate_in(stack_set, instance, action, account, region):
     from .handlers import _create_stack, _delete_stack, _update_stack
 
-    account, region = instance["Account"], instance["Region"]
     with request_scope(account, region):
         from ministack.services.cloudformation import _stacks
         name = instance.get("StackName")

@@ -4,6 +4,7 @@
 CloudFormation helpers — XML response formatting and parameter extraction utilities.
 """
 
+import contextvars
 import logging
 import re
 from html import escape as _esc
@@ -185,6 +186,14 @@ def client_request_token_problems(token: str) -> list[str]:
     return problems
 
 
+# Set while the service operates a stack on its own account — a StackSet's
+# instance, stood from the StackSet's template, which a StackSet may hold up to
+# the size a TemplateURL admits. The inline TemplateBody limit is a request's,
+# and no request carries that template, so the check does not apply there.
+service_operation: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "cfn_service_operation", default=False)
+
+
 def _template_body_problem(body: str) -> str | None:
     """The request-level constraint on ``TemplateBody`` (the quota page:
     "Template body size in a request", 51,200 bytes), as one sentence of the
@@ -206,7 +215,8 @@ def _request_problems(params, stack_name: str = ""):
     before it answers. Returns the error response, or None when the request
     passes."""
     problems = stack_name_problems(stack_name) if stack_name else []
-    body_problem = _template_body_problem(_p(params, "TemplateBody"))
+    body_problem = (None if service_operation.get()
+                    else _template_body_problem(_p(params, "TemplateBody")))
     if body_problem:
         problems.append(body_problem)
     problems.extend(capabilities_problems(_extract_string_members(params, "Capabilities")))
