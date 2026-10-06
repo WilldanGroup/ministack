@@ -1460,6 +1460,23 @@ class TestResourceArn:
         ) == {"dynamodb:Attributes": ["a", "b"], "dynamodb:Select": "SPECIFIC_ATTRIBUTES"}
         assert dynamodb_service_context(b"not json") == {}
 
+    def test_s3_listing_carries_its_query_parameters(self):
+        """A bucket listing carries s3:prefix, s3:delimiter and s3:max-keys
+        as sent, an empty prefix among them, and none it did not send."""
+        from ministack.core.iam_actions import s3_service_context
+        assert s3_service_context(
+            "s3:ListBucket", {"prefix": "schemas/", "delimiter": "/", "max-keys": "100"}
+        ) == {"s3:prefix": "schemas/", "s3:delimiter": "/", "s3:max-keys": "100"}
+        assert s3_service_context(
+            "s3:ListBucketVersions", {"versions": "", "prefix": "schemas/"}
+        ) == {"s3:prefix": "schemas/"}
+        assert s3_service_context("s3:ListBucket", {"prefix": ""}) == {"s3:prefix": ""}
+        assert s3_service_context("s3:ListBucket", {"list-type": "2"}) == {}
+
+    def test_s3_request_other_than_a_listing_carries_no_listing_keys(self):
+        from ministack.core.iam_actions import s3_service_context
+        assert s3_service_context("s3:GetObject", {"prefix": "schemas/"}) == {}
+
     def test_eventbridge_put_events_defaults_to_default_bus(self):
         from ministack.core.iam_actions import extract_resource_arn
         body = json.dumps({"Entries": [{"Source": "example"}]}).encode()

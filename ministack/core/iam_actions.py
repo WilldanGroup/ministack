@@ -391,6 +391,31 @@ def s3_additional_checks(method: str, path: str, headers: dict, body: bytes,
     return checks
 
 
+# The listings S3 authorizes on the request's own parameters: ListObjects and
+# ListObjectsV2 (s3:ListBucket) and ListObjectVersions (s3:ListBucketVersions)
+# carry s3:prefix, s3:delimiter and s3:max-keys, per the S3 actions and
+# condition keys reference.
+_S3_LIST_ACTIONS = frozenset({"s3:ListBucket", "s3:ListBucketVersions"})
+_S3_LIST_CONDITION_PARAMS = ("prefix", "delimiter", "max-keys")
+
+
+def s3_service_context(iam_action: str, query_params: dict) -> dict:
+    """The S3 condition keys a request carries.
+
+    A bucket listing carries ``s3:prefix``, ``s3:delimiter`` and
+    ``s3:max-keys`` from its query string, each as sent and only when the
+    request sends it: a grant conditioned on ``s3:prefix`` admits a listing
+    under that prefix and refuses one that names none, as AWS does.
+    """
+    if iam_action not in _S3_LIST_ACTIONS:
+        return {}
+    return {
+        f"s3:{name}": _query_param(query_params, name)
+        for name in _S3_LIST_CONDITION_PARAMS
+        if name in query_params
+    }
+
+
 # Lambda REST path → IAM action
 def _lambda_action(method: str, path: str) -> str | None:
     parts = [p for p in path.split("/") if p]

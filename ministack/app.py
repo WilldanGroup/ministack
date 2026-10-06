@@ -2426,6 +2426,7 @@ async def _dispatch_service_request(
             extract_resource_arn,
             kms_resource_arns,
             kms_service_context,
+            s3_service_context,
         )
         from ministack.core.iam_evaluator import AuthError, enforce, pin_request_caller
         from ministack.core.responses import get_account_id
@@ -2443,6 +2444,8 @@ async def _dispatch_service_request(
                 service_context = kms_service_context(resource_arn)
             elif service == "cloudformation":
                 service_context = cloudformation_service_context(resource_arn)
+            elif service == "s3":
+                service_context = s3_service_context(iam_action, routing_params)
             else:
                 service_context = None
             transaction = (
