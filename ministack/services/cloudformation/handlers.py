@@ -48,6 +48,7 @@ from .helpers import (
     enum_problems,
     validation_error_message,
 )
+from .stacksets import STACK_SET_HANDLERS
 from .stacks import (
     CLIENT_REQUEST_TOKEN,
     _add_event,
@@ -1730,4 +1731,5 @@ _ACTION_HANDLERS = {
     "DescribeStackDriftDetectionStatus": _describe_stack_drift_detection_status,
     "DetectStackResourceDrift": _detect_stack_resource_drift,
     "DescribeStackResourceDrifts": _describe_stack_resource_drifts,
+    **STACK_SET_HANDLERS,
 }

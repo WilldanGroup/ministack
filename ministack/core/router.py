@@ -1140,6 +1140,19 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "DescribeStackDriftDetectionStatus": "cloudformation",
             "DetectStackResourceDrift": "cloudformation",
             "DescribeStackResourceDrifts": "cloudformation",
+            "CreateStackSet": "cloudformation",
+            "UpdateStackSet": "cloudformation",
+            "DeleteStackSet": "cloudformation",
+            "DescribeStackSet": "cloudformation",
+            "ListStackSets": "cloudformation",
+            "CreateStackInstances": "cloudformation",
+            "UpdateStackInstances": "cloudformation",
+            "DeleteStackInstances": "cloudformation",
+            "ListStackInstances": "cloudformation",
+            "DescribeStackInstance": "cloudformation",
+            "DescribeStackSetOperation": "cloudformation",
+            "ListStackSetOperations": "cloudformation",
+            "ListStackSetOperationResults": "cloudformation",
             # EBS Snapshots
             # Note: CreateSnapshot, DeleteSnapshot, DescribeSnapshots are intentionally
             # omitted here because they conflict with ElastiCache actions of the same

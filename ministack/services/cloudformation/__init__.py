@@ -9,7 +9,7 @@ Supports: CreateStack, UpdateStack, DeleteStack, DescribeStacks, ListStacks,
           DeleteChangeSet, ListChangeSets,
           GetTemplateSummary, RollbackStack, DetectStackDrift,
           DescribeStackDriftDetectionStatus, DetectStackResourceDrift,
-          DescribeStackResourceDrifts.
+          DescribeStackResourceDrifts, and self-managed StackSets (stacksets.py).
 Uses Query API (Action=...) with form-encoded body.
 """
 
@@ -95,6 +95,8 @@ def reset():
     _cr.reset()
     from ministack.services.cloudformation import wait_conditions as _wc
     _wc.reset()
+    from ministack.services.cloudformation import stacksets as _ss
+    _ss.reset()
 
 
 # Stores that need to survive a PERSIST_STATE=1 stop/restore cycle. The actual
