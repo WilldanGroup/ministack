@@ -2122,7 +2122,9 @@ def _ddb_condition_failed(table_name, key, condition, wanted):
     """A failed condition as AppSync handles it: the item read again, and the
     write answered as done where what stands is what it wanted to leave —
     the item it would have put, apart from `equalsIgnore`, or no item for a
-    delete — and refused otherwise."""
+    delete — and refused otherwise, under the Reject strategy, with the item
+    read handed to response() as ctx.result beside the error. An update is
+    never answered as done: AppSync cannot tell what it wanted to leave."""
     current = _ddb_get(table_name, key, (condition or {}).get("consistentRead", True))
     ignore = set((condition or {}).get("equalsIgnore") or [])
     if wanted == "absent":
@@ -2146,6 +2148,7 @@ def _ddb_op_put_item(table_name, req):
             done, current = _ddb_condition_failed(table_name, key, req.get("condition"), item)
             if done:
                 return current
+            raise _ddb_refusal(failure, result=current)
         raise _ddb_refusal(failure)
     return _ddb_plain(item)
 
@@ -2157,6 +2160,9 @@ def _ddb_op_update_item(table_name, req):
     _ddb_expression(data, req.get("condition"), "ConditionExpression")
     answer, failure = _ddb_call("UpdateItem", data)
     if failure:
+        if failure[0] == "ConditionalCheckFailedException":
+            _done, current = _ddb_condition_failed(table_name, key, req.get("condition"), None)
+            raise _ddb_refusal(failure, result=current)
         raise _ddb_refusal(failure)
     attributes = answer.get("Attributes")
     return _ddb_plain(attributes) if attributes else None
@@ -2169,9 +2175,10 @@ def _ddb_op_delete_item(table_name, req):
     answer, failure = _ddb_call("DeleteItem", data)
     if failure:
         if failure[0] == "ConditionalCheckFailedException":
-            done, _current = _ddb_condition_failed(table_name, key, req.get("condition"), "absent")
+            done, current = _ddb_condition_failed(table_name, key, req.get("condition"), "absent")
             if done:
                 return None
+            raise _ddb_refusal(failure, result=current)
         raise _ddb_refusal(failure)
     attributes = answer.get("Attributes")
     return _ddb_plain(attributes) if attributes else None
@@ -2429,7 +2436,8 @@ class _AppSyncResolverError(Exception):
         self.data = data
         self.error_info = error_info
         # What a data source answers beside its error, which AppSync still
-        # hands response() as ctx.result: a cancelled transaction's reasons.
+        # hands response() as ctx.result: a cancelled transaction's reasons,
+        # or the item a refused condition read.
         self.result = result
 
 
