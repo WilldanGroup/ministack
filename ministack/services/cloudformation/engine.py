@@ -1238,32 +1238,38 @@ def _resolve_refs(value, resources, params, conditions, mappings,
             return export["Value"]
         raise ValueError(f"Export '{export_name}' not found")
 
-    # --- Fn::GetStackOutput (aws-cdk-local cross-stack reference) ---
-    # Not an AWS intrinsic: aws-cdk-local rewrites CDK cross-stack references
-    # into this instead of Fn::ImportValue, and resolves it to a named output
-    # of another already-deployed stack (deploy order is dependency-sorted, so
-    # the producer stack's outputs are present by the time the consumer stack
-    # resolves this). Left unresolved, the dict reaches provisioners as e.g. a
-    # Lambda::Permission FunctionName and crashes with
-    # "'dict' object has no attribute 'startswith'".
+    # --- Fn::GetStackOutput ---
+    # A named stack's output, read when the stack that names it is created or
+    # updated (CloudFormation's Template Reference): in the region the
+    # function names — a stack in one region reads one in another this way —
+    # and in the reading stack's own where it names none, which is how
+    # aws-cdk-local's rewritten cross-stack references read. A stack that does
+    # not stand in that region, or that reports no such output, is refused,
+    # never read as an empty value.
     if "Fn::GetStackOutput" in value:
         from ministack.services.cloudformation import _stacks
         spec = value["Fn::GetStackOutput"]
-        if isinstance(spec, dict):
-            target_stack = _resolve_refs(spec.get("StackName", ""), resources,
-                                         params, conditions, mappings,
-                                         stack_name, stack_id)
-            output_name = _resolve_refs(spec.get("OutputName", ""), resources,
-                                        params, conditions, mappings,
-                                        stack_name, stack_id)
-            stack = _stacks.get(str(target_stack))
-            if stack:
-                for o in stack.get("Outputs", []):
-                    if o.get("OutputKey") == output_name:
-                        return o.get("OutputValue", "")
+        if not isinstance(spec, dict):
             raise ValueError(
-                f"Output '{output_name}' not found in stack '{target_stack}'")
-        return ""
+                "Template error: Fn::GetStackOutput takes StackName, OutputName "
+                "and an optional Region")
+
+        def _part(name):
+            return str(_resolve_refs(spec.get(name, ""), resources, params,
+                                     conditions, mappings, stack_name,
+                                     stack_id))
+        target_stack = _part("StackName")
+        output_name = _part("OutputName")
+        region = _part("Region") if spec.get("Region") else get_region()
+        stack = _stacks.get_scoped(get_account_id(), region, target_stack)
+        if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
+            raise ValueError(
+                f"Stack with id {target_stack} does not exist in {region}")
+        for o in stack.get("Outputs", []):
+            if o.get("OutputKey") == output_name:
+                return o.get("OutputValue", "")
+        raise ValueError(
+            f"Stack {target_stack} in {region} has no output {output_name}")
 
     # --- Fn::GetAZs ---
     if "Fn::GetAZs" in value:
