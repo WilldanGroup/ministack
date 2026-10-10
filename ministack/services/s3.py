@@ -6211,6 +6211,12 @@ def _put_bucket_replication(bucket_name: str, body: bytes):
         status_el = _find_xml_tag(rule_el, "Status")
         rule["Status"] = status_el.text if status_el is not None and status_el.text else "Enabled"
         prefix_el = _find_xml_tag(rule_el, "Prefix")
+        if prefix_el is None:
+            # A rule of the current schema filters by Filter's Prefix rather
+            # than its own; without reading it, the rule would cover every key.
+            filter_el = _find_xml_tag(rule_el, "Filter")
+            if filter_el is not None:
+                prefix_el = _find_xml_tag(filter_el, "Prefix")
         if prefix_el is not None and prefix_el.text is not None:
             rule["Prefix"] = prefix_el.text
         dest_el = _find_xml_tag(rule_el, "Destination")

@@ -1230,6 +1230,55 @@ def _s3_notification_json_to_xml(notif: dict) -> bytes:
     return tostring(root, encoding="utf-8")
 
 
+def _s3_replication_json_to_xml(replication: dict) -> bytes:
+    """Serialize an ``AWS::S3::Bucket`` ``ReplicationConfiguration`` (CloudFormation
+    JSON) into the S3 REST XML that ``_put_bucket_replication`` parses. The names
+    are the API's but for a rule's ``Id``, which the API calls ``ID``; a rule's
+    ``Filter`` and ``DeleteMarkerReplication`` keep their shape."""
+    from xml.etree.ElementTree import Element, SubElement, tostring
+
+    root = Element("ReplicationConfiguration", xmlns=_s3.S3_NS)
+    SubElement(root, "Role").text = str(replication.get("Role", ""))
+    for rule in replication.get("Rules") or []:
+        rule_el = SubElement(root, "Rule")
+        if rule.get("Id"):
+            SubElement(rule_el, "ID").text = str(rule["Id"])
+        if rule.get("Priority") is not None:
+            SubElement(rule_el, "Priority").text = str(rule["Priority"])
+        SubElement(rule_el, "Status").text = str(rule.get("Status", "Enabled"))
+        if rule.get("Prefix") is not None:
+            SubElement(rule_el, "Prefix").text = str(rule["Prefix"])
+        filt = rule.get("Filter")
+        if isinstance(filt, dict):
+            filter_el = SubElement(rule_el, "Filter")
+            if filt.get("Prefix") is not None:
+                SubElement(filter_el, "Prefix").text = str(filt["Prefix"])
+        marker = rule.get("DeleteMarkerReplication")
+        if isinstance(marker, dict) and marker.get("Status"):
+            SubElement(SubElement(rule_el, "DeleteMarkerReplication"), "Status").text = str(
+                marker["Status"]
+            )
+        dest = rule.get("Destination") or {}
+        dest_el = SubElement(rule_el, "Destination")
+        SubElement(dest_el, "Bucket").text = str(dest.get("Bucket", ""))
+        if dest.get("StorageClass"):
+            SubElement(dest_el, "StorageClass").text = str(dest["StorageClass"])
+    return tostring(root, encoding="utf-8")
+
+
+def _s3_apply_replication(name, replication):
+    """Route a CloudFormation ``ReplicationConfiguration`` through the same S3 API
+    path a ``PutBucketReplication`` call takes, so a bucket a stack declares
+    replicates as one configured by the API does, and a configuration the API
+    refuses fails the stack."""
+    xml = _s3_replication_json_to_xml(replication or {})
+    result = _s3._put_bucket_replication(name, xml)
+    if result[0] >= 400:
+        raise ValueError(
+            f"AWS::S3::Bucket ReplicationConfiguration rejected: {result[2]!r}"
+        )
+
+
 def _s3_apply_notification(name, notif):
     """Route a CloudFormation ``NotificationConfiguration`` through the same S3 API
     path a ``PutBucketNotificationConfiguration`` call takes — validation, the
@@ -1304,6 +1353,8 @@ def _s3_create(logical_id, props, stack_name):
         _s3._bucket_versioning[name] = "Enabled"
     if "NotificationConfiguration" in props:
         _s3_apply_notification(name, props["NotificationConfiguration"])
+    if "ReplicationConfiguration" in props:
+        _s3_apply_replication(name, props["ReplicationConfiguration"])
     attrs = {
         "Arn": f"arn:aws:s3:::{name}",
         "DomainName": f"{name}.s3.amazonaws.com",
@@ -1333,6 +1384,10 @@ def _s3_update(physical_id, old_props, new_props, stack_name):
         elif "NotificationConfiguration" in old_props:
             # Property removed on update — clear the configuration, as AWS does.
             _s3._bucket_notifications.pop(name, None)
+        if "ReplicationConfiguration" in new_props:
+            _s3_apply_replication(name, new_props["ReplicationConfiguration"])
+        elif "ReplicationConfiguration" in old_props:
+            _s3._bucket_replication.pop(name, None)
     else:
         return _s3_create(name, new_props, stack_name)
     attrs = {
@@ -1376,6 +1431,7 @@ def _s3_delete(physical_id, props):
     _s3._bucket_cors.pop(physical_id, None)
     _s3._bucket_acl.pop(physical_id, None)
     _s3._bucket_notifications.pop(physical_id, None)
+    _s3._bucket_replication.pop(physical_id, None)
 
 
 # --- SQS Queue ---
