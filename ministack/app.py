@@ -2453,12 +2453,13 @@ async def _dispatch_service_request(
                 if service == "dynamodb" else None
             )
             if transaction is not None:
-                # Each item as the action it performs, on its own table.
+                # Each item as the action it performs, on its own table, with
+                # the condition keys it carries.
                 denied = None
-                for item_action, item_arn in transaction:
+                for item_action, item_arn, item_context in transaction:
                     denied = enforce(
                         access_key, item_action, service, region,
-                        resource_arn=item_arn, service_context=service_context,
+                        resource_arn=item_arn, service_context=item_context,
                     )
                     if denied:
                         iam_action = item_action

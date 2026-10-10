@@ -1816,8 +1816,9 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
 
 
 # A transaction has no IAM action of its own: AWS authorizes each item it
-# carries as the single-item action it performs, on that item's table
-# ("Using IAM with DynamoDB transactions", Amazon DynamoDB Developer Guide).
+# carries as the single-item action it performs, on that item's table, with
+# the condition keys that item carries ("Using IAM with DynamoDB
+# transactions", Amazon DynamoDB Developer Guide).
 _TRANSACTION_ITEM_ACTIONS = {
     "dynamodb:TransactWriteItems": {
         "Put": "dynamodb:PutItem",
@@ -1830,8 +1831,9 @@ _TRANSACTION_ITEM_ACTIONS = {
 
 
 def dynamodb_transaction_checks(iam_action: str, body: bytes, region: str,
-                                account_id: str) -> list[tuple[str, str]] | None:
-    """``(action, table ARN)`` for every item a transaction carries, or ``None``
+                                account_id: str) -> list[tuple[str, str, dict]] | None:
+    """``(action, table ARN, service context)`` for every item a transaction
+    carries, each context the condition keys of that item alone, or ``None``
     when ``iam_action`` is not a transaction or its items cannot be read, in
     which case the request is authorized as it names itself."""
     item_actions = _TRANSACTION_ITEM_ACTIONS.get(iam_action)
@@ -1851,7 +1853,11 @@ def dynamodb_transaction_checks(iam_action: str, body: bytes, region: str,
         for member, action in item_actions.items():
             request = item.get(member)
             if isinstance(request, dict) and isinstance(request.get("TableName"), str):
-                checks.append((action, f"arn:aws:dynamodb:{region}:{account_id}:table/{request['TableName']}"))
+                checks.append((
+                    action,
+                    f"arn:aws:dynamodb:{region}:{account_id}:table/{request['TableName']}",
+                    dynamodb_service_context(json.dumps(request).encode()),
+                ))
     return checks or None
 
 
