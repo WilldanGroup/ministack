@@ -6,6 +6,7 @@ CloudFormation change set handlers — Create, Describe, Execute, Delete, List c
 
 import copy
 import logging
+import re
 
 import ministack.services.dynamodb as _dynamodb
 import ministack.services.s3 as _s3
@@ -15,6 +16,7 @@ import ministack.services.ssm as _ssm
 from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
 
 from .engine import (
+    _NO_VALUE,
     _apply_transforms,
     _evaluate_conditions,
     _parse_template,
@@ -309,6 +311,10 @@ def _resolve_props_for_diff(template, params, stack_name, stack_id):
     Lambda code updates, while ``update-stack`` worked (#897). Resolution is
     best-effort: refs that can't resolve at change-set time (e.g. GetAtt to a
     not-yet-provisioned resource) fall back to the raw Properties on both sides.
+
+    A resource whose Condition is false is left out, as CloudFormation creates
+    none for it: one false on both sides is no change, and one whose
+    condition turns is an Add or a Remove.
     """
     if not template:
         return {}
@@ -319,6 +325,8 @@ def _resolve_props_for_diff(template, params, stack_name, stack_id):
     mappings = template.get("Mappings", {})
     resolved = {}
     for lid, res in template.get("Resources", {}).items():
+        if res.get("Condition") and not conditions.get(res["Condition"], True):
+            continue
         new_res = dict(res)
         try:
             new_res["Properties"] = _resolve_refs(
@@ -328,6 +336,266 @@ def _resolve_props_for_diff(template, params, stack_name, stack_id):
             new_res["Properties"] = res.get("Properties", {})
         resolved[lid] = new_res
     return {"Resources": resolved}
+
+
+# --- Change sets for nested stacks ---
+
+_NESTED_STACK = "AWS::CloudFormation::Stack"
+# A nested change set's ExecutionStatus and StatusReason: "You must execute or
+# delete change sets for nested stacks from the root change set" (Change sets
+# for nested stacks, in the CloudFormation User Guide, whose describe of a
+# nested change set answers these two).
+_FROM_ROOT = "Executable from root change set"
+
+
+class _NestedPlanError(Exception):
+    """A nested stack whose change set could not be planned; the message is
+    the root change set's StatusReason."""
+
+
+def _nested_change_set_name(parent_name, logical_id):
+    """A nested change set's name: its parent's, the nested stack's logical
+    id and a random suffix, within the 128 characters a name may have. AWS's
+    own form is unmeasured."""
+    suffix = new_uuid().replace("-", "")[:12].upper()
+    return f"{parent_name}-{logical_id}"[:115] + f"-{suffix}"
+
+
+_SUB_TARGET = re.compile(r"\$\{([^!}][^}.]*)")
+
+
+def _reads_unstood(value, declared, resources):
+    """Whether ``value`` reads a resource of the template that does not stand
+    yet, whose physical id and attributes are not known until it is created:
+    a ``Ref``, an ``Fn::GetAtt`` or a ``Fn::Sub`` variable naming it."""
+    def unstood(logical_id):
+        return logical_id in declared and logical_id not in resources
+
+    if isinstance(value, list):
+        return any(_reads_unstood(item, declared, resources) for item in value)
+    if not isinstance(value, dict):
+        return False
+    if isinstance(value.get("Ref"), str) and unstood(value["Ref"]):
+        return True
+    att = value.get("Fn::GetAtt")
+    if att is not None:
+        target = att.split(".", 1)[0] if isinstance(att, str) else (att or [None])[0]
+        if isinstance(target, str) and unstood(target):
+            return True
+    sub = value.get("Fn::Sub")
+    text = sub[0] if isinstance(sub, list) and sub else sub
+    if isinstance(text, str) and any(unstood(m) for m in _SUB_TARGET.findall(text)):
+        return True
+    return any(_reads_unstood(item, declared, resources) for item in value.values())
+
+
+def _nested_stack_properties(res_def, declared, resources, param_values, conditions,
+                             mappings, stack_name, stack_id):
+    """A nested stack resource's properties as the update will hand them to
+    the child, resolved against what its parent stands with now, and the
+    names of the parameters that read something not known until the update
+    runs (a sibling being added), which keep the child's own values."""
+    def resolve(value):
+        return _resolve_refs(copy.deepcopy(value), resources, param_values,
+                             conditions, mappings, stack_name, stack_id)
+
+    props = res_def.get("Properties") or {}
+    resolved, unknown = {}, set()
+    for key, value in props.items():
+        if key == "Parameters" and isinstance(value, dict):
+            given = {}
+            for name, raw in value.items():
+                if _reads_unstood(raw, declared, resources):
+                    unknown.add(name)
+                    continue
+                try:
+                    given[name] = resolve(raw)
+                except Exception:
+                    unknown.add(name)
+            resolved[key] = {k: v for k, v in given.items() if v is not _NO_VALUE}
+            continue
+        try:
+            resolved[key] = resolve(value)
+        except Exception:
+            resolved[key] = value
+    return {k: v for k, v in resolved.items() if v is not _NO_VALUE}, unknown
+
+
+def _nested_parameter_values(template, given, unknown, previous):
+    """The child's parameter values, as the nested-stack deploy hands them: a
+    list as its comma-delimited string; a parameter read from something not
+    yet known keeps its standing value. Where they do not resolve as the
+    deploy's would (a required parameter left unknown), each takes what it
+    can, so the plan still compares the child's resources."""
+    provided = [
+        {"Key": k, "Value": "" if v is None
+         else ",".join(str(m) for m in v) if isinstance(v, list) else str(v)}
+        for k, v in given.items()
+    ] + [{"Key": k, "UsePreviousValue": True} for k in sorted(unknown) if k in previous]
+    try:
+        return _resolve_parameters(template, provided, previous)
+    except ValueError:
+        values = {}
+        for name, defn in (template.get("Parameters") or {}).items():
+            standing = previous.get(name) or {}
+            value = next((p["Value"] for p in provided if p["Key"] == name and "Value" in p),
+                         standing.get("Value", defn.get("Default", "")))
+            values[name] = {"Value": str(value),
+                            "NoEcho": str(defn.get("NoEcho", "false")).lower() == "true"}
+        return values
+
+
+def _plan_nested_change_sets(changes, parent, parent_id, template, param_values,
+                             parent_cs, root_cs_id, planned):
+    """Plan a change set for each nested stack ``changes`` adds or modifies, and
+    below it for each of its own, and name it on the change as
+    ``ChangeSetId`` ("The change set ID of the nested change set",
+    API_ResourceChange). ``parent`` is the stack the changes are planned for,
+    ``template`` and ``param_values`` what it is to be updated with. Each
+    planned change set, and each stack an added nested stack stands in
+    REVIEW_IN_PROGRESS until it is executed, is appended to ``planned`` so a
+    failed plan can take them back. A removed nested stack is deleted whole
+    and plans none. Raises _NestedPlanError."""
+    from ministack.services.cloudformation import _change_sets, _stack_events, _stacks
+    from ministack.services.cloudformation.provisioners import _nested_stack_lookup_name
+
+    defs = template.get("Resources") or {}
+    conditions = _evaluate_conditions(template, param_values)
+    mappings = template.get("Mappings", {})
+    parent_name = parent["StackName"]
+    for change in changes:
+        rc = change["ResourceChange"]
+        if rc.get("ResourceType") != _NESTED_STACK or rc.get("Action") not in ("Add", "Modify"):
+            continue
+        logical_id = rc["LogicalResourceId"]
+        props, unknown = _nested_stack_properties(
+            defs.get(logical_id, {}), defs, parent.get("_resources", {}), param_values,
+            conditions, mappings, parent_name, parent_id)
+        template_url = props.get("TemplateURL")
+        if not isinstance(template_url, str) or not template_url:
+            raise _NestedPlanError(
+                f"Nested stack [{logical_id}]: TemplateURL does not resolve to an address")
+        body, err = _resolve_template({"TemplateURL": [template_url]})
+        if err is not None or not body:
+            raise _NestedPlanError(
+                f"Nested stack [{logical_id}]: failed to fetch its template from {template_url}")
+        try:
+            child_template = _parse_template(body)
+        except Exception as exc:
+            raise _NestedPlanError(f"Nested stack [{logical_id}]: Template format error: {exc}")
+
+        # A nested stack the parent does not stand with is created by the
+        # update, as the parent's deploy creates a resource it holds none of.
+        pid = (parent.get("_resources", {}).get(logical_id) or {}).get("PhysicalResourceId")
+        standing = _stacks.get(_nested_stack_lookup_name(pid)) if pid else None
+        previous = (standing or {}).get("_resolved_params", {})
+        child_params = _nested_parameter_values(
+            child_template, props.get("Parameters") or {}, unknown, previous)
+
+        if standing is None:
+            # An added nested stack stands in REVIEW_IN_PROGRESS until its
+            # change set is executed or deleted from the root ("Nested stacks
+            # in the REVIEW_IN_PROGRESS status will also be deleted if they
+            # were created during the create-change-set operation").
+            child_name = f"{parent_name}-{logical_id}-{new_uuid()[:12]}"
+            child_id = (f"arn:aws:cloudformation:{_stack_region(parent, parent_id)}:"
+                        f"{get_account_id()}:stack/{child_name}/{new_uuid()}")
+            standing = {
+                "StackName": child_name,
+                "StackId": child_id,
+                "StackStatus": "REVIEW_IN_PROGRESS",
+                "StackStatusReason": "",
+                "CreationTime": now_iso(),
+                "LastUpdatedTime": now_iso(),
+                "Description": "",
+                "Parameters": [],
+                "Tags": [],
+                "Outputs": [],
+                "DisableRollback": False,
+                "_region": _stack_region(parent, parent_id),
+                "_resources": {},
+                "_template": {},
+                "_template_body": "",
+                "_resolved_params": {},
+                "_conditions": {},
+                "_parent_stack_name": parent_name,
+                "_nested_logical_id": logical_id,
+                "_review_for": root_cs_id,
+                "RootId": parent.get("RootId") or parent_id,
+                "ParentId": parent_id,
+            }
+            _stacks[child_name] = standing
+            _stack_events[child_id] = []
+            _add_event(child_id, child_name, child_name, _NESTED_STACK,
+                       "REVIEW_IN_PROGRESS", physical_id=child_id)
+            planned.append(("stack", child_name))
+            cs_type = "CREATE"
+        else:
+            cs_type = "UPDATE"
+        child_name, child_id = standing["StackName"], standing["StackId"]
+
+        with _stack_region_context(standing, child_id):
+            old_resolved = _resolve_props_for_diff(
+                standing.get("_template", {}), previous, child_name, child_id)
+            new_resolved = _resolve_props_for_diff(
+                child_template, child_params, child_name, child_id)
+        child_changes = _diff_resources(old_resolved, new_resolved, standing.get("_resources"))
+        cs_name = _nested_change_set_name(parent_cs["ChangeSetName"], logical_id)
+        cs_id = (f"arn:aws:cloudformation:{_stack_region(standing, child_id)}:"
+                 f"{get_account_id()}:changeSet/{cs_name}/{new_uuid()}")
+        nested = {
+            "ChangeSetId": cs_id,
+            "ChangeSetName": cs_name,
+            "StackId": child_id,
+            "StackName": child_name,
+            "Status": "CREATE_COMPLETE",
+            "ExecutionStatus": "UNAVAILABLE",
+            "StatusReason": _FROM_ROOT,
+            "CreationTime": now_iso(),
+            "Description": "",
+            "ChangeSetType": cs_type,
+            "Changes": child_changes,
+            "Parameters": [
+                {"ParameterKey": k, "ParameterValue": v["Value"]}
+                for k, v in child_params.items()
+            ],
+            "Tags": [],
+            "Capabilities": list(parent_cs.get("Capabilities", [])),
+            "OnStackFailure": "",
+            "IncludeNestedStacks": True,
+            "ParentChangeSetId": parent_cs["ChangeSetId"],
+            "RootChangeSetId": root_cs_id,
+            "_template": child_template,
+            "_template_body": body,
+            "_resolved_params": child_params,
+        }
+        with _stack_region_context(standing, child_id):
+            _change_sets[cs_id] = nested
+        planned.append(("change_set", cs_id))
+        rc["ChangeSetId"] = cs_id
+        _plan_nested_change_sets(child_changes, standing, child_id, child_template,
+                                 child_params, nested, root_cs_id, planned)
+
+
+def _nested_change_sets(root_cs_id):
+    """Every change set planned below the root change set ``root_cs_id``."""
+    from ministack.services.cloudformation import _change_sets
+    return [cs for cs in _change_sets.values() if cs.get("RootChangeSetId") == root_cs_id]
+
+
+def _drop_change_set(cs_id):
+    """Delete a change set, and with a root change set every nested one below
+    it and each nested stack its plan stood in REVIEW_IN_PROGRESS ("delete-
+    change-set must be executed from the root change set and will delete the
+    whole hierarchy of change sets")."""
+    from ministack.services.cloudformation import _change_sets, _stack_events, _stacks
+    for nested in _nested_change_sets(cs_id):
+        _change_sets.pop(nested["ChangeSetId"], None)
+    for name in [name for name, stack in _stacks.items()
+                 if stack.get("_review_for") == cs_id
+                 and stack.get("StackStatus") == "REVIEW_IN_PROGRESS"]:
+        _stack_events.pop(_stacks.pop(name)["StackId"], None)
+    _change_sets.pop(cs_id, None)
 
 
 def _create_change_set(params):
@@ -531,6 +799,32 @@ def _create_change_set(params):
         f"arn:aws:cloudformation:{_stack_region(stack, stack_id)}:{get_account_id()}:"
         f"changeSet/{cs_name}/{new_uuid()}"
     )
+    capabilities = _extract_string_members(params, "Capabilities")
+
+    # IncludeNestedStacks: "Creates a change set for the all nested stacks
+    # specified in the template" (API_CreateChangeSet). Each nested stack the
+    # change set adds or modifies is planned a change set of its own, named on
+    # its change, so a describe walks the hierarchy as it does on AWS.
+    include_nested = _p(params, "IncludeNestedStacks", "false").lower() == "true"
+    nested_failure = None
+    if include_nested and cs_type in ("CREATE", "UPDATE") and changes:
+        planned = []
+        root = {"ChangeSetId": cs_id, "ChangeSetName": cs_name, "Capabilities": capabilities}
+        with _stack_region_context(stack, stack_id):
+            try:
+                _plan_nested_change_sets(changes, stack, stack_id, template, param_values,
+                                         root, cs_id, planned)
+            except _NestedPlanError as exc:
+                # The plan is taken back whole: a failed change set names no
+                # nested change set and leaves no nested stack in review.
+                for kind, key in planned:
+                    if kind == "change_set":
+                        _change_sets.pop(key, None)
+                    else:
+                        _stack_events.pop(_stacks.pop(key, {}).get("StackId"), None)
+                for change in changes:
+                    change["ResourceChange"].pop("ChangeSetId", None)
+                nested_failure = str(exc)
 
     if import_failure:
         # AWS accepts an import of a resource that does not exist and fails
@@ -539,6 +833,8 @@ def _create_change_set(params):
     elif cs_type == "IMPORT":
         _cs_status, _cs_exec = "CREATE_COMPLETE", "UNAVAILABLE"
         _cs_reason = "Resource import is not supported by this emulator"
+    elif nested_failure:
+        _cs_status, _cs_exec, _cs_reason = "FAILED", "UNAVAILABLE", nested_failure
     elif changes:
         _cs_status, _cs_exec, _cs_reason = "CREATE_COMPLETE", "AVAILABLE", ""
     else:
@@ -566,8 +862,9 @@ def _create_change_set(params):
             for k, v in param_values.items()
         ],
         "Tags": tags,
-        "Capabilities": _extract_string_members(params, "Capabilities"),
+        "Capabilities": capabilities,
         "OnStackFailure": on_stack_failure,
+        "IncludeNestedStacks": include_nested,
         "_tags_given": tags_given,
         "_template": template,
         "_template_body": template_body,
@@ -583,6 +880,18 @@ def _create_change_set(params):
 
 
 # --- DescribeChangeSet ---
+
+def _hierarchy_xml(cs):
+    """Where a change set stands in a nested hierarchy: IncludeNestedStacks,
+    and for a nested change set its parent's and its root's ids, which a root
+    change set does not carry."""
+    xml = f"<IncludeNestedStacks>{'true' if cs.get('IncludeNestedStacks') else 'false'}" \
+          "</IncludeNestedStacks>"
+    for key in ("ParentChangeSetId", "RootChangeSetId"):
+        if cs.get(key):
+            xml += f"<{key}>{_esc(cs[key])}</{key}>"
+    return xml
+
 
 def _describe_change_set(params):
     cs_name = _p(params, "ChangeSetName")
@@ -636,6 +945,10 @@ def _describe_change_set(params):
         policy_xml = (
             f"<PolicyAction>{rc['PolicyAction']}</PolicyAction>" if "PolicyAction" in rc else ""
         )
+        nested_xml = (
+            f"<ChangeSetId>{_esc(rc['ChangeSetId'])}</ChangeSetId>"
+            if rc.get("ChangeSetId") else ""
+        )
         # "Resource" is the one ChangeType, and AWS reports it on every change.
         changes_xml += (
             "<member><Type>Resource</Type><ResourceChange>"
@@ -645,6 +958,7 @@ def _describe_change_set(params):
             f"<ResourceType>{_esc(rc.get('ResourceType', ''))}</ResourceType>"
             f"{replacement_xml}"
             f"{policy_xml}"
+            f"{nested_xml}"
             f"<Scope>{scope_xml}</Scope>"
             f"<Details>{details_xml}</Details>"
             "</ResourceChange></member>"
@@ -679,6 +993,7 @@ def _describe_change_set(params):
     )
     if cs.get("OnStackFailure"):
         inner += f"<OnStackFailure>{cs['OnStackFailure']}</OnStackFailure>"
+    inner += _hierarchy_xml(cs)
 
     return _xml(200, "DescribeChangeSetResponse",
                 f"<DescribeChangeSetResult>{inner}</DescribeChangeSetResult>")
@@ -704,6 +1019,9 @@ async def _track_change_set_execution(change_set, stack, deploy_coro):
             change_set["ExecutionStatus"] = "EXECUTE_COMPLETE"
         else:
             change_set["ExecutionStatus"] = "EXECUTE_FAILED"
+        # The root's execution applies the whole hierarchy.
+        for nested in _nested_change_sets(change_set["ChangeSetId"]):
+            nested["ExecutionStatus"] = change_set["ExecutionStatus"]
 
 
 def _execute_change_set(params):
@@ -744,6 +1062,8 @@ def _execute_change_set(params):
                         or _p(params, "DisableRollback", "false").lower() == "true")
 
     cs["ExecutionStatus"] = "EXECUTE_IN_PROGRESS"
+    for nested in _nested_change_sets(cs["ChangeSetId"]):
+        nested["ExecutionStatus"] = "EXECUTE_IN_PROGRESS"
     real_stack_name = cs["StackName"]
     stack = _stacks.get(real_stack_name)
     if not stack:
@@ -814,7 +1134,7 @@ def _execute_change_set(params):
     from ministack.services.cloudformation import _change_sets as _cs_store
     for _cid in [c for c, v in _cs_store.items()
                  if v.get("StackId") == stack_id and c != _executed_cs_id]:
-        _cs_store.pop(_cid, None)
+        _drop_change_set(_cid)
 
     # ExecutionStatus stays EXECUTE_IN_PROGRESS until the deploy finishes, when
     # _track_change_set_execution sets EXECUTE_COMPLETE or EXECUTE_FAILED. Status
@@ -828,7 +1148,6 @@ def _execute_change_set(params):
 # --- DeleteChangeSet ---
 
 def _delete_change_set(params):
-    from ministack.services.cloudformation import _change_sets
     from ministack.services.cloudformation.handlers import _resolve_stack
     cs_name = _p(params, "ChangeSetName")
     stack_name = _p(params, "StackName")
@@ -842,6 +1161,12 @@ def _delete_change_set(params):
         return _error("ValidationError",
                       f"Stack [{stack_name}] does not exist")
     cs_id, _cs = _find_change_set(cs_name, stack["StackName"] if stack else stack_name)
+    if _cs and _cs.get("ParentChangeSetId"):
+        # "The delete operation must be executed from the root change set"
+        # (Change sets for nested stacks); the error wording is not measured.
+        return _error("ValidationError",
+                      f"ChangeSet [{cs_name}] is a nested change set; delete its root "
+                      f"change set [{_cs['RootChangeSetId']}] instead.")
     # Real CloudFormation answers a delete of a change set that does not exist
     # (on a stack that does) with a plain success, and the CDK relies on that:
     # before every deploy of an existing stack it removes a possible leftover
@@ -849,7 +1174,7 @@ def _delete_change_set(params):
     # -- so the 404 answered here aborted every `cdk deploy` of an already
     # deployed stack.
     if cs_id:
-        _change_sets.pop(cs_id, None)
+        _drop_change_set(cs_id)
     return _xml(200, "DeleteChangeSetResponse", "<DeleteChangeSetResult/>")
 
 
@@ -878,6 +1203,7 @@ def _list_change_sets(params):
             f"<ExecutionStatus>{cs['ExecutionStatus']}</ExecutionStatus>"
             f"<CreationTime>{cs['CreationTime']}</CreationTime>"
             f"<Description>{_esc(cs.get('Description', ''))}</Description>"
+            f"{_hierarchy_xml(cs)}"
             "</member>"
         )
 

@@ -4190,11 +4190,21 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
     param_values = _resolve_parameters(template, provided_params)
 
     is_update = previous_physical_id is not None
+    in_review = None
     if is_update and previous_physical_id in _stacks:
         child_name = previous_physical_id
         previous_stack_snapshot = copy.deepcopy(_stacks[child_name])
     else:
-        child_name = f"{parent_stack_name}-{logical_id}-{new_uuid()[:12]}"
+        # A nested stack the parent's executed change set added stands in
+        # REVIEW_IN_PROGRESS under the name and id its change set was planned
+        # for, and is created there.
+        in_review = next((
+            stack for stack in _stacks.values()
+            if stack.get("StackStatus") == "REVIEW_IN_PROGRESS"
+            and stack.get("_parent_stack_name") == parent_stack_name
+            and stack.get("_nested_logical_id") == logical_id), None)
+        child_name = (in_review["StackName"] if in_review
+                      else f"{parent_stack_name}-{logical_id}-{new_uuid()[:12]}")
         previous_stack_snapshot = None
 
     child_stack_id = (
@@ -4203,6 +4213,8 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
     )
     if previous_stack_snapshot:
         child_stack_id = previous_stack_snapshot.get("StackId", child_stack_id)
+    elif in_review:
+        child_stack_id = in_review["StackId"]
 
     status_prefix = "UPDATE" if is_update else "CREATE"
     child_stack = {
