@@ -17202,6 +17202,127 @@ def test_cfn_kms_key_delete_schedules_deletion(cfn, kms_client):
     assert "DeletionDate" in meta
 
 
+# ── AWS::KMS::ReplicaKey ────────────────────────────────────────────────────
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-kms-replicakey.html
+# The replica stands in the stack's region, of a primary stood in another.
+
+_REPLICA_REGION = "eu-west-1"
+
+
+def _kms_replica_key_template(props):
+    return json.dumps(
+        {
+            "Resources": {"Replica": {"Type": "AWS::KMS::ReplicaKey", "Properties": props}},
+            "Outputs": {
+                "ReplicaRef": {"Value": {"Ref": "Replica"}},
+                "ReplicaArn": {"Value": {"Fn::GetAtt": ["Replica", "Arn"]}},
+                "ReplicaKeyId": {"Value": {"Fn::GetAtt": ["Replica", "KeyId"]}},
+            },
+        }
+    )
+
+
+def _stand_replica(primary_arn, **props):
+    cfn = _regional_cfn_test_client("cloudformation", _REPLICA_REGION)
+    stack_name = f"cfn-kms-replica-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=_kms_replica_key_template(
+            {"PrimaryKeyArn": primary_arn, "KeyPolicy": _KMS_KEY_POLICY, **props}
+        ),
+    )
+    return cfn, stack_name, _wait_stack(cfn, stack_name)
+
+
+def test_cfn_kms_replica_key_replicates_the_primary_into_the_stack_region(kms_client):
+    """The replica shares the primary's id and material, carries its own
+    description, policy and tags, and answers Ref and GetAtt as documented."""
+    primary = kms_client.create_key(MultiRegion=True, Description="primary")["KeyMetadata"]
+    cfn, stack_name, stack = _stand_replica(
+        primary["Arn"],
+        Description="the class's key, here",
+        Tags=[{"Key": "owner", "Value": "class"}],
+    )
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    outputs = _kms_stack_outputs(cfn, stack_name)
+    replica_arn = f"arn:aws:kms:{_REPLICA_REGION}:000000000000:key/{primary['KeyId']}"
+    assert outputs["ReplicaRef"] == primary["KeyId"]
+    assert outputs["ReplicaKeyId"] == primary["KeyId"]
+    assert outputs["ReplicaArn"] == replica_arn
+
+    kms_there = _regional_cfn_test_client("kms", _REPLICA_REGION)
+    meta = kms_there.describe_key(KeyId=replica_arn)["KeyMetadata"]
+    assert meta["KeyState"] == "Enabled"
+    assert meta["Description"] == "the class's key, here"
+    assert meta["MultiRegionConfiguration"]["MultiRegionKeyType"] == "REPLICA"
+    assert meta["MultiRegionConfiguration"]["PrimaryKey"]["Arn"] == primary["Arn"]
+    policy = json.loads(kms_there.get_key_policy(KeyId=replica_arn, PolicyName="default")["Policy"])
+    assert policy["Id"] == "cfn-supplied-key-policy"
+    tags = kms_there.list_resource_tags(KeyId=replica_arn)["Tags"]
+    assert {"TagKey": "owner", "TagValue": "class"} in tags
+
+    # What the primary encrypts, the replica decrypts.
+    blob = kms_client.encrypt(KeyId=primary["Arn"], Plaintext=b"row")["CiphertextBlob"]
+    assert kms_there.decrypt(KeyId=replica_arn, CiphertextBlob=blob)["Plaintext"] == b"row"
+    home = kms_client.describe_key(KeyId=primary["Arn"])["KeyMetadata"]
+    assert [r["Region"] for r in home["MultiRegionConfiguration"]["ReplicaKeys"]] == [_REPLICA_REGION]
+
+
+def test_cfn_kms_replica_key_of_a_key_already_replicated_there_fails(kms_client):
+    """A second replica of the same primary in the same region is refused, as
+    ReplicateKey refuses it, and the first stands untouched."""
+    primary = kms_client.create_key(MultiRegion=True)["KeyMetadata"]
+    _cfn, _first, stack = _stand_replica(primary["Arn"])
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    _cfn, _second, stack = _stand_replica(primary["Arn"])
+    assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+    kms_there = _regional_cfn_test_client("kms", _REPLICA_REGION)
+    replica_arn = f"arn:aws:kms:{_REPLICA_REGION}:000000000000:key/{primary['KeyId']}"
+    assert kms_there.describe_key(KeyId=replica_arn)["KeyMetadata"]["KeyState"] == "Enabled"
+
+
+def test_cfn_kms_replica_key_of_a_single_region_key_fails(kms_client):
+    primary = kms_client.create_key()["KeyMetadata"]
+    _cfn, _stack_name, stack = _stand_replica(primary["Arn"])
+    assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+
+
+def test_cfn_kms_replica_key_updates_in_place(kms_client):
+    primary = kms_client.create_key(MultiRegion=True)["KeyMetadata"]
+    cfn, stack_name, _stack = _stand_replica(primary["Arn"], Description="before")
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=_kms_replica_key_template(
+            {"PrimaryKeyArn": primary["Arn"], "KeyPolicy": _KMS_KEY_POLICY,
+             "Description": "after", "Enabled": False}
+        ),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    replica_arn = _kms_stack_outputs(cfn, stack_name)["ReplicaArn"]
+    meta = _regional_cfn_test_client("kms", _REPLICA_REGION).describe_key(KeyId=replica_arn)["KeyMetadata"]
+    assert meta["Description"] == "after"
+    assert meta["KeyState"] == "Disabled"
+
+
+def test_cfn_kms_replica_key_delete_schedules_deletion_and_releases_the_primary(kms_client):
+    """Removing the replica schedules its deletion with the template's window,
+    and a primary waiting on it then moves on to PendingDeletion."""
+    primary = kms_client.create_key(MultiRegion=True)["KeyMetadata"]
+    cfn, stack_name, _stack = _stand_replica(primary["Arn"], PendingWindowInDays=30)
+    replica_arn = _kms_stack_outputs(cfn, stack_name)["ReplicaArn"]
+    kms_client.schedule_key_deletion(KeyId=primary["Arn"], PendingWindowInDays=30)
+    assert kms_client.describe_key(KeyId=primary["Arn"])["KeyMetadata"]["KeyState"] == "PendingReplicaDeletion"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+    meta = _regional_cfn_test_client("kms", _REPLICA_REGION).describe_key(KeyId=replica_arn)["KeyMetadata"]
+    assert meta["KeyState"] == "PendingDeletion"
+    assert meta["Enabled"] is False
+    assert kms_client.describe_key(KeyId=primary["Arn"])["KeyMetadata"]["KeyState"] == "PendingDeletion"
+
+
 # ===========================================================================
 # CloudFormation Custom Resource protocol tests
 # (merged from the former tests/test_cfn_custom_resource.py — #603)

@@ -59,7 +59,10 @@ import ministack.services.sqs as _sqs
 import ministack.services.ssm as _ssm
 import ministack.services.stepfunctions as _sfn
 import ministack.services.waf as _waf
+from ministack.core.arn import ArnParseError as _ArnParseError
+from ministack.core.arn import parse_arn as _parse_arn
 from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
+from ministack.core.responses import request_scope as _request_scope
 
 logger = logging.getLogger("cloudformation")
 
@@ -1004,6 +1007,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::IAM::Role": ("Tags", "list"),
     "AWS::IAM::OIDCProvider": ("Tags", "list"),
     "AWS::KMS::Key": ("Tags", "list"),
+    "AWS::KMS::ReplicaKey": ("Tags", "list"),
     "AWS::Kinesis::Stream": ("Tags", "list"),
     "AWS::Lambda::Function": ("Tags", "list"),
     "AWS::Location::Tracker": ("Tags", "list"),
@@ -7594,6 +7598,90 @@ def _kms_key_delete(physical_id, props):
         })
 
 
+def _kms_replica_key_create(logical_id, props, stack_name):
+    """AWS::KMS::ReplicaKey: a replica of a multi-Region primary key in the
+    stack's own region, made the way the service makes one, by ReplicateKey on
+    the primary in the primary's region, so it shares the primary's id and key
+    material and joins the topology every member reports. Its description,
+    policy and tags are its own. ReplicateKey's refusals fail the stack: a
+    primary that is not multi-Region or not a primary, and a replica of a key
+    already replicated here (AlreadyExistsException), as AWS refuses them.
+    https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-kms-replicakey.html"""
+    primary_arn = props.get("PrimaryKeyArn", "")
+    if not primary_arn:
+        raise ValueError("AWS::KMS::ReplicaKey requires PrimaryKeyArn")
+    if not props.get("KeyPolicy"):
+        raise ValueError("AWS::KMS::ReplicaKey requires KeyPolicy")
+    try:
+        primary_region = _parse_arn(primary_arn).region
+    except _ArnParseError:
+        raise ValueError(
+            f"AWS::KMS::ReplicaKey {logical_id}: PrimaryKeyArn {primary_arn!r} "
+            "is not a KMS key's ARN")
+    policy = props["KeyPolicy"]
+    payload = {
+        "KeyId": primary_arn,
+        "ReplicaRegion": get_region(),
+        "Description": props.get("Description", ""),
+        "Policy": policy if isinstance(policy, str) else json.dumps(policy),
+        "Tags": _kms_tags(props),
+    }
+    with _request_scope(get_account_id(), primary_region):
+        status, _headers, body = _kms._replicate_key(payload)
+    if status != 200:
+        raise Exception(
+            f"AWS::KMS::ReplicaKey {logical_id}: {json.loads(body).get('message')}"
+        )
+    rec = _kms._resolve_key(json.loads(body)["ReplicaKeyMetadata"]["Arn"])
+    _kms_apply_replica_key_props(rec, props)
+    return rec["KeyId"], {"Arn": rec["Arn"], "KeyId": rec["KeyId"]}
+
+
+def _kms_apply_replica_key_props(rec, props):
+    """Enabled, which ReplicateKey has no parameter for: "When Enabled is
+    true, the key state of the replica key is Enabled... The default value is
+    true." A replica scheduled for deletion is left alone."""
+    if rec.get("KeyState") in ("PendingDeletion", "PendingReplicaDeletion"):
+        return
+    enabled = props.get("Enabled") is not False
+    rec["Enabled"] = enabled
+    rec["KeyState"] = "Enabled" if enabled else "Disabled"
+
+
+def _kms_replica_key_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """PrimaryKeyArn requires replacement: a replica of the new primary is
+    made before the old replica is scheduled for deletion. Description,
+    KeyPolicy, Tags and Enabled change in place."""
+    rec = _kms._resolve_key(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        new_props.get("PrimaryKeyArn", ""),
+        old_props.get("PrimaryKeyArn", "") if rec else None,
+        _kms_replica_key_create, _kms_replica_key_delete,
+    )
+    if replaced is not None:
+        return replaced
+    rec["Description"] = new_props.get("Description", "")
+    policy = new_props.get("KeyPolicy")
+    if policy is not None:
+        rec["Policy"] = policy if isinstance(policy, str) else json.dumps(policy)
+    rec["Tags"] = _kms_tags(new_props)
+    _kms_apply_replica_key_props(rec, new_props)
+    return physical_id, {"Arn": rec["Arn"], "KeyId": rec["KeyId"]}
+
+
+def _kms_replica_key_delete(physical_id, props):
+    # "When you remove a replica key from a CloudFormation stack, AWS KMS
+    # schedules the replica key for deletion", with the template's
+    # PendingWindowInDays (default 30). ScheduleKeyDeletion on the replica
+    # takes it out of the topology, so a primary waiting on it moves on.
+    if _kms._resolve_key(physical_id):
+        _kms._schedule_key_deletion({
+            "KeyId": physical_id,
+            "PendingWindowInDays": props.get("PendingWindowInDays", 30),
+        })
+
+
 _KMS_ALIAS_NAME = re.compile(r"^alias/[a-zA-Z0-9:/_-]{1,250}$")
 
 
@@ -12733,6 +12821,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::CodeBuild::Fleet": ("Name",),
     "AWS::CodeArtifact::Domain": ("DomainName", "EncryptionKey"),
     "AWS::CodeArtifact::Repository": ("DomainName", "DomainOwner", "RepositoryName"),
+    "AWS::KMS::ReplicaKey": ("PrimaryKeyArn",),
     "AWS::AppSync::DomainName": ("DomainName",),
     "AWS::AppSync::DomainNameApiAssociation": ("DomainName",),
     "AWS::SSM::Parameter": ("Name",),
@@ -13246,6 +13335,12 @@ _RESOURCE_HANDLERS = {
         "create": _kms_key_create,
         "update": _kms_key_update,
         "delete": _kms_key_delete,
+    },
+    "AWS::KMS::ReplicaKey": {
+        "create": _kms_replica_key_create,
+        "update": _kms_replica_key_update,
+        "update_with_logical_id": True,
+        "delete": _kms_replica_key_delete,
     },
     "AWS::KMS::Alias": {
         "create": _kms_alias_create,
