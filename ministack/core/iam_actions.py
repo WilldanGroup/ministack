@@ -1202,6 +1202,9 @@ def extract_resource_arn(service: str, method: str, path: str,
             if name.startswith("arn:"):
                 return name
             return f"arn:aws:cloudformation:{region}:{account_id}:stack/{name}/*"
+        change_set = _query_param(query_params, "ChangeSetName")
+        if change_set.startswith("arn:"):
+            return cloudformation_change_set_stack_arn(change_set, region)
         return "*"
 
     if service == "monitoring":
@@ -1730,6 +1733,33 @@ def kms_service_context(resource_arn: str) -> dict:
         for alias_arn, target_id in kms_svc._aliases.items_scoped(account_id, region)
         if target_id == key_id
     )}
+
+
+def cloudformation_change_set_stack_arn(change_set_arn: str, region: str) -> str:
+    """The ARN of the stack a change set named by its own ARN is planned for.
+
+    AWS authorizes the change set calls (DescribeChangeSet, ExecuteChangeSet,
+    DeleteChangeSet, DescribeChangeSetHooks, GetTemplate of a change set) on
+    the stack, the one resource type the CloudFormation service authorization
+    reference gives them, and a call naming the change set by its ARN alone
+    names no stack: the ARN is ``changeSet/<name>/<id>``. The change set is
+    looked up and the check made against its stack. One that does not stand
+    is ``*``, as before.
+    """
+    from ministack.services.cloudformation import _change_sets
+
+    parts = change_set_arn.split(":", 5)
+    if len(parts) != 6 or parts[2] != "cloudformation" or not parts[5].startswith("changeSet/"):
+        return "*"
+    _, _, _, arn_region, account_id, _ = parts
+    # A change set is held in the region the request that made it ran in,
+    # and its ARN names its stack's region: the two differ only for a stack
+    # stood in a region other than the request's.
+    for scope in dict.fromkeys((arn_region, region)):
+        change_set = _change_sets.get_scoped(account_id, scope, change_set_arn)
+        if isinstance(change_set, dict) and change_set.get("StackId"):
+            return change_set["StackId"]
+    return "*"
 
 
 def cloudformation_service_context(resource_arn: str) -> dict:
