@@ -980,6 +980,8 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::CloudFront::Distribution": ("Tags", "list"),
     "AWS::CloudWatch::Alarm": ("Tags", "list"),
     "AWS::CodeBuild::Project": ("Tags", "list"),
+    "AWS::CodeArtifact::Domain": ("Tags", "list"),
+    "AWS::CodeArtifact::Repository": ("Tags", "list"),
     "AWS::CodeBuild::Fleet": ("Tags", "list"),
     "AWS::Cognito::IdentityPool": ("IdentityPoolTags", "map"),
     "AWS::Cognito::UserPool": ("UserPoolTags", "map"),
@@ -7285,6 +7287,117 @@ def _codebuild_fleet_delete(physical_id, props):
     _codebuild._fleets.pop(physical_id, None)
 
 
+# --- CodeArtifact Domain and Repository provisioners ---
+#
+# The emulator serves no CodeArtifact API, so these record the resource and
+# answer its Ref and the attributes the resource reference lists, and nothing
+# reads a package from them. Ref is the ARN, as on AWS: a domain's is
+# domain/<name>, a repository's repository/<domain>/<name>. What the service
+# itself refuses is refused here too: a second domain or repository of one
+# name, a repository in a domain that does not stand, an upstream that does
+# not stand in the domain, and more than one external connection.
+
+_codeartifact_records: dict[str, dict] = {}
+
+
+def _codeartifact_arn(kind, path):
+    return f"arn:aws:codeartifact:{get_region()}:{get_account_id()}:{kind}/{path}"
+
+
+def _codeartifact_domain_create(logical_id, props, stack_name):
+    name = props.get("DomainName")
+    if not name:
+        raise ValueError("Property DomainName is required for AWS::CodeArtifact::Domain")
+    arn = _codeartifact_arn("domain", name)
+    if arn in _codeartifact_records:
+        raise ValueError(f"ConflictException: domain {name} already exists")
+    _codeartifact_records[arn] = {"Properties": copy.deepcopy(props)}
+    return arn, {"Arn": arn, "Name": name, "Owner": get_account_id()}
+
+
+def _codeartifact_domain_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """DomainName is create-only (aws-resource-codeartifact-domain) and is the
+    ARN's last field: a rename replaces, the new domain created before the old
+    one goes. The rest is recorded in place."""
+    name = new_props.get("DomainName")
+    record = _codeartifact_records.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, record["Properties"].get("DomainName") if record else None,
+        _codeartifact_domain_create, _codeartifact_domain_delete,
+    )
+    if replaced is not None:
+        return replaced
+    record["Properties"] = copy.deepcopy(new_props)
+    return physical_id, {"Arn": physical_id, "Name": name, "Owner": get_account_id()}
+
+
+def _codeartifact_domain_delete(physical_id, props):
+    _codeartifact_records.pop(physical_id, None)
+
+
+def _codeartifact_repository_attrs(arn, props):
+    return {
+        "Arn": arn,
+        "Name": props["RepositoryName"],
+        "DomainName": props["DomainName"],
+        "DomainOwner": props.get("DomainOwner") or get_account_id(),
+    }
+
+
+def _codeartifact_repository_create(logical_id, props, stack_name):
+    domain = props.get("DomainName")
+    name = props.get("RepositoryName")
+    if not domain or not name:
+        raise ValueError(
+            "Properties DomainName and RepositoryName are required for "
+            "AWS::CodeArtifact::Repository"
+        )
+    if _codeartifact_arn("domain", domain) not in _codeartifact_records:
+        raise ValueError(f"ResourceNotFoundException: domain {domain} does not exist")
+    connections = props.get("ExternalConnections") or []
+    if len(connections) > 1:
+        raise ValueError(
+            f"ValidationException: repository {name} names {len(connections)} external "
+            "connections, and a repository carries at most one"
+        )
+    for upstream in props.get("Upstreams") or []:
+        if _codeartifact_arn("repository", f"{domain}/{upstream}") not in _codeartifact_records:
+            raise ValueError(
+                f"ResourceNotFoundException: upstream {upstream} does not exist in domain {domain}"
+            )
+    arn = _codeartifact_arn("repository", f"{domain}/{name}")
+    if arn in _codeartifact_records:
+        raise ValueError(f"ConflictException: repository {name} already exists in domain {domain}")
+    _codeartifact_records[arn] = {"Properties": copy.deepcopy(props)}
+    return arn, _codeartifact_repository_attrs(arn, props)
+
+
+def _codeartifact_repository_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """DomainName and RepositoryName are create-only
+    (aws-resource-codeartifact-repository) and the ARN carries both: a change of
+    either replaces, the new repository created before the old one goes.
+    Upstreams, ExternalConnections, Description and Tags are recorded in
+    place."""
+    declared = _codeartifact_arn(
+        "repository", f"{new_props.get('DomainName')}/{new_props.get('RepositoryName')}"
+    )
+    record = _codeartifact_records.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        declared, physical_id if record else None,
+        _codeartifact_repository_create, _codeartifact_repository_delete,
+    )
+    if replaced is not None:
+        return replaced
+    record["Properties"] = copy.deepcopy(new_props)
+    return physical_id, _codeartifact_repository_attrs(physical_id, new_props)
+
+
+def _codeartifact_repository_delete(physical_id, props):
+    _codeartifact_records.pop(physical_id, None)
+
+
 # --- IAM ManagedPolicy provisioner ---
 
 def _iam_managed_policy_create(logical_id, props, stack_name):
@@ -12618,6 +12731,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Route53::RecordSetGroup": ("HostedZoneId", "HostedZoneName"),
     "AWS::IAM::OIDCProvider": ("Url",),
     "AWS::CodeBuild::Fleet": ("Name",),
+    "AWS::CodeArtifact::Domain": ("DomainName", "EncryptionKey"),
+    "AWS::CodeArtifact::Repository": ("DomainName", "DomainOwner", "RepositoryName"),
     "AWS::AppSync::DomainName": ("DomainName",),
     "AWS::AppSync::DomainNameApiAssociation": ("DomainName",),
     "AWS::SSM::Parameter": ("Name",),
@@ -13108,6 +13223,18 @@ _RESOURCE_HANDLERS = {
         "update": _codebuild_fleet_update,
         "update_with_logical_id": True,
         "delete": _codebuild_fleet_delete,
+    },
+    "AWS::CodeArtifact::Domain": {
+        "create": _codeartifact_domain_create,
+        "update": _codeartifact_domain_update,
+        "update_with_logical_id": True,
+        "delete": _codeartifact_domain_delete,
+    },
+    "AWS::CodeArtifact::Repository": {
+        "create": _codeartifact_repository_create,
+        "update": _codeartifact_repository_update,
+        "update_with_logical_id": True,
+        "delete": _codeartifact_repository_delete,
     },
     "AWS::IAM::ManagedPolicy": {
         "create": _iam_managed_policy_create,
