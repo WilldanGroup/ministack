@@ -9943,7 +9943,10 @@ def _r53_record_set_create(logical_id, props, stack_name):
         current.append(rs)
         _r53._records[zone_id] = current
     fqdn = rs["Name"]
-    return fqdn, {"Name": fqdn}
+    # Ref is the record's name as the template declares it, which is what
+    # CloudFormation returns; the zone holds it with the trailing dot Route 53
+    # writes, and a reader of the Ref takes the name without one.
+    return str(props["Name"]), {"Name": fqdn}
 
 
 def _r53_record_set_delete(physical_id, props):
@@ -12722,7 +12725,8 @@ def _r53_record_set_update(physical_id, old_props, new_props, stack_name):
         records = [r for r in records if _r53._rs_key(r) != key]
         records.append(new_rs)
         _r53._records[zone_id] = records
-    return new_rs["Name"], {"Name": new_rs["Name"]}
+    # The same record: its physical id, the name its create declared, stands.
+    return physical_id, {"Name": new_rs["Name"]}
 
 
 def _scheduler_schedule_update(physical_id, old_props, new_props, stack_name):
