@@ -388,13 +388,15 @@ EXECUTION_BUILDSPEC = "version: 0.2\nphases:\n  build:\n    commands:\n      - e
 
 
 def _execution_project(buildspec=EXECUTION_BUILDSPEC):
+    # A project of the test host's own architecture, which an executed build
+    # runs on; one of the other is refused (below).
     return {
         "name": "demo",
         "arn": "arn:aws:codebuild:us-east-1:000000000000:project/demo",
         "source": {"type": "NO_SOURCE", "buildspec": buildspec},
         "artifacts": {"type": "NO_ARTIFACTS"},
         "environment": {
-            "type": "LINUX_CONTAINER",
+            "type": "ARM_CONTAINER" if codebuild.HOST_ARCHITECTURE == "arm64" else "LINUX_CONTAINER",
             "image": "aws/codebuild/standard:7.0",
             "computeType": "BUILD_GENERAL1_SMALL",
             "privilegedMode": True,
@@ -408,6 +410,110 @@ def _seed_execution_build(project, build_id="demo:0001"):
     build = codebuild._make_build_record(project, build_id)
     codebuild._builds[build_id] = build
     return build
+
+
+# The CodeBuild agent of the emulator host's own architecture, pinned by the
+# digest AWS publishes for each ("Run builds locally with the AWS CodeBuild
+# agent"); a build of the other architecture is refused, never emulated.
+AWS_AGENT_DIGESTS = {
+    "x86_64": "sha256:ccb19bdd7af94e4dc761e4c58c267e9455c28ec68d938086b4dc1cf8fe6b0940",
+    "arm64": "sha256:7d7b5d35d2ac4e062ae7ba8c662ffed15229a52d09bd0d664a7816c439679192",
+}
+
+
+@pytest.mark.parametrize("machine, architecture", [
+    ("aarch64", "arm64"),
+    ("arm64", "arm64"),
+    ("x86_64", "x86_64"),
+    ("AMD64", "x86_64"),
+])
+def test_the_host_architecture_is_its_machines(machine, architecture):
+    assert codebuild._host_architecture(machine) == architecture
+
+
+@pytest.mark.parametrize("architecture", ["arm64", "x86_64"])
+def test_the_agent_of_each_architecture_is_pinned_by_aws_published_digest(architecture):
+    image = codebuild.AGENT_IMAGES[architecture]
+    assert image == f"public.ecr.aws/codebuild/local-builds@{AWS_AGENT_DIGESTS[architecture]}"
+
+
+def _on_host(monkeypatch, architecture):
+    """This emulator as a host of `architecture` with execution on, capturing
+    the builds it would hand the agent."""
+    executed = []
+    monkeypatch.setattr(codebuild, "EXECUTE_BUILDS", True)
+    monkeypatch.setattr(codebuild, "HOST_ARCHITECTURE", architecture)
+    monkeypatch.setattr(codebuild, "AGENT_IMAGE", codebuild.AGENT_IMAGES.get(architecture))
+    monkeypatch.setattr(codebuild, "_execute_build", lambda bid, project: executed.append(bid))
+    return executed
+
+
+def _project_on(environment_type):
+    project = _execution_project()
+    project["environment"]["type"] = environment_type
+    codebuild._projects["demo"] = project
+    return project
+
+
+@pytest.mark.parametrize("host, environment_type", [
+    ("arm64", "ARM_CONTAINER"),
+    ("x86_64", "LINUX_CONTAINER"),
+])
+def test_start_build_runs_a_project_of_the_hosts_architecture(monkeypatch, host, environment_type):
+    executed = _on_host(monkeypatch, host)
+    _project_on(environment_type)
+
+    status, _headers, body = codebuild._start_build({"projectName": "demo"})
+
+    assert status == 200
+    build_id = json.loads(body)["build"]["id"]
+    deadline = time.time() + 5
+    while not executed and time.time() < deadline:
+        time.sleep(0.01)
+    assert executed == [build_id]
+
+
+@pytest.mark.parametrize("host, environment_type, other", [
+    ("arm64", "LINUX_CONTAINER", "x86_64"),
+    ("x86_64", "ARM_CONTAINER", "arm64"),
+])
+def test_start_build_refuses_a_project_of_the_other_architecture_naming_both(
+        monkeypatch, host, environment_type, other):
+    executed = _on_host(monkeypatch, host)
+    _project_on(environment_type)
+    before = set(codebuild._builds.keys())
+
+    status, _headers, body = codebuild._start_build({"projectName": "demo"})
+
+    assert status == 400
+    error = json.loads(body)
+    assert error["__type"] == "InvalidInputException"
+    assert other in error["message"] and host in error["message"]
+    assert set(codebuild._builds.keys()) == before
+    assert executed == []
+
+
+def test_start_build_refuses_an_override_of_the_other_architecture(monkeypatch):
+    executed = _on_host(monkeypatch, "arm64")
+    _project_on("ARM_CONTAINER")
+
+    status, _headers, body = codebuild._start_build({
+        "projectName": "demo", "environmentTypeOverride": "LINUX_CONTAINER",
+    })
+
+    assert status == 400
+    assert "x86_64" in json.loads(body)["message"]
+    assert executed == []
+
+
+def test_start_build_that_is_not_executed_runs_no_agent_and_is_refused_nothing(monkeypatch):
+    monkeypatch.setattr(codebuild, "EXECUTE_BUILDS", False)
+    monkeypatch.setattr(codebuild, "HOST_ARCHITECTURE", "arm64")
+    _project_on("LINUX_CONTAINER")
+
+    status, _headers, _body = codebuild._start_build({"projectName": "demo"})
+
+    assert status == 200
 
 
 def test_start_build_is_metadata_only_by_default(monkeypatch):
