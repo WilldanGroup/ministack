@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import re
 import secrets
 import threading
@@ -213,9 +214,61 @@ def _make_build_record(project, build_id, source_version=None):
 
 EXECUTE_BUILDS = os.environ.get("MINISTACK_CODEBUILD_EXECUTE", "0").lower() in ("1", "true", "yes")
 
-# The fixed image AWS's own codebuild_build.sh uses to run a local build; not
-# a real choice, so it is not configurable.
-AGENT_IMAGE = "public.ecr.aws/codebuild/local-builds:latest"
+# The image AWS's own codebuild_build.sh uses to run a local build, of each
+# host architecture, each pinned by the digest AWS publishes for it ("Run
+# builds locally with the AWS CodeBuild agent": the x86_64 agent's SHA and the
+# ARM agent's), the one the `latest` and `aarch64` tags name. Not a real
+# choice, so it is not configurable: a build runs in the agent of the
+# emulator's own host architecture, and nothing runs emulated.
+AGENT_IMAGES = {
+    "x86_64": "public.ecr.aws/codebuild/local-builds@sha256:ccb19bdd7af94e4dc761e4c58c267e9455c28ec68d938086b4dc1cf8fe6b0940",
+    "arm64": "public.ecr.aws/codebuild/local-builds@sha256:7d7b5d35d2ac4e062ae7ba8c662ffed15229a52d09bd0d664a7816c439679192",
+}
+
+# The architecture each of CodeBuild's environment types runs builds on.
+ENVIRONMENT_ARCHITECTURES = {
+    "LINUX_CONTAINER": "x86_64",
+    "LINUX_GPU_CONTAINER": "x86_64",
+    "LINUX_LAMBDA_CONTAINER": "x86_64",
+    "LINUX_EC2": "x86_64",
+    "ARM_CONTAINER": "arm64",
+    "ARM_LAMBDA_CONTAINER": "arm64",
+    "ARM_EC2": "arm64",
+}
+
+
+def _host_architecture(machine=None):
+    """The emulator host's architecture, in CodeBuild's ARM/x86 words: this
+    container's machine, which is its Docker host's, since nothing here runs
+    emulated."""
+    machine = (machine or platform.machine()).lower()
+    return {"aarch64": "arm64", "arm64": "arm64", "amd64": "x86_64"}.get(machine, machine)
+
+
+HOST_ARCHITECTURE = _host_architecture()
+
+# The agent of the host's architecture, or None where AWS publishes none.
+AGENT_IMAGE = AGENT_IMAGES.get(HOST_ARCHITECTURE)
+
+
+def _architecture_refusal(project, environment_type_override=None):
+    """Why this host runs no build of `project`, or None where it does.
+
+    A build runs in the agent of the host's own architecture, on an image of
+    that architecture, so a project whose environment is the other
+    architecture's is refused, naming both, before any agent starts: CodeBuild
+    runs a build on a host of its environment's architecture, and this
+    emulator has one."""
+    environment_type = environment_type_override or project.get("environment", {}).get("type", "")
+    if AGENT_IMAGE is None:
+        return (f"Build execution needs CodeBuild's local agent of this emulator's host "
+                f"architecture, {HOST_ARCHITECTURE}, and AWS publishes none for it")
+    wanted = ENVIRONMENT_ARCHITECTURES.get(environment_type)
+    if wanted is None or wanted == HOST_ARCHITECTURE:
+        return None
+    return (f"Project {project.get('name', '')} builds on {environment_type}, which is {wanted}, "
+            f"and this emulator's host is {HOST_ARCHITECTURE}: a build runs on a host of its "
+            f"own architecture and is not emulated")
 
 # Internal scratch space for the source/artifacts/env files handed to the
 # agent container; not an AWS concept, so not configurable.
@@ -1111,6 +1164,10 @@ def _start_build(data):
     if not project_name or project_name not in _projects:
         return error_response_json("ResourceNotFoundException",
                                    f"Project not found: {project_name}", 400)
+    if EXECUTE_BUILDS:
+        refusal = _architecture_refusal(_projects[project_name], data.get("environmentTypeOverride"))
+        if refusal:
+            return error_response_json("InvalidInputException", refusal, 400)
     project = _with_environment_overrides(
         _projects[project_name], data.get("environmentVariablesOverride"))
     bid = _build_id(project_name)
