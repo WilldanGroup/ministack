@@ -2,6 +2,7 @@ import json
 import os
 import threading
 import time
+import uuid
 
 import boto3
 import pytest
@@ -144,6 +145,66 @@ def test_codebuild_start_build(codebuild):
     assert build["buildStatus"] == "SUCCEEDED"
     assert build["arn"].startswith("arn:aws:codebuild:")
     assert "phases" in build
+
+
+def _build_state_changes(sqs, queue_url, build_arn, until, timeout=20):
+    """``(build-status, detail)`` for each CodeBuild Build State Change the
+    queue receives for ``build_arn`` until one at ``until`` has arrived."""
+    got = []
+    deadline = time.time() + timeout
+    while time.time() < deadline and until not in [status for status, _detail in got]:
+        for msg in sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10,
+                                       WaitTimeSeconds=1).get("Messages", []):
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+            event = json.loads(msg["Body"])
+            if event["resources"] == [build_arn]:
+                assert event["source"] == "aws.codebuild"
+                assert event["detail-type"] == "CodeBuild Build State Change"
+                got.append((event["detail"]["build-status"], event))
+    return got
+
+
+def test_codebuild_build_state_changes_reach_the_default_bus(codebuild, sqs, eb):
+    """A started build puts a CodeBuild Build State Change on the default bus
+    as it starts and as it ends, naming its project, its build ARN and the
+    variables it ran with, so a rule on aws.codebuild learns the build ended."""
+    suffix = uuid.uuid4().hex[:8]
+    project = f"cb-state-{suffix}"
+    rule = f"cb-state-{suffix}"
+    queue_url = sqs.create_queue(QueueName=f"cb-state-{suffix}")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(Name=rule, EventPattern=json.dumps({
+        "source": ["aws.codebuild"], "detail-type": ["CodeBuild Build State Change"]}))
+    eb.put_targets(Rule=rule, Targets=[{"Id": "q", "Arn": queue_arn}])
+    codebuild.create_project(**_project_args(project, "state changes"))
+    try:
+        build = codebuild.start_build(
+            projectName=project,
+            environmentVariablesOverride=[{"name": "RUN", "value": suffix, "type": "PLAINTEXT"}],
+        )["build"]
+
+        changes = _build_state_changes(sqs, queue_url, build["arn"], "SUCCEEDED")
+
+        assert [status for status, _event in changes] == ["IN_PROGRESS", "SUCCEEDED"]
+        ended = changes[-1][1]
+        assert ended["account"] == build["arn"].split(":")[4]
+        assert ended["region"] == build["arn"].split(":")[3]
+        detail = ended["detail"]
+        assert detail["project-name"] == project
+        assert detail["build-id"] == build["arn"]
+        information = detail["additional-information"]
+        assert information["build-complete"] is True
+        assert {"name": "RUN", "type": "PLAINTEXT", "value": suffix} in (
+            information["environment"]["environment-variables"])
+        assert information["phases"][-1] == {
+            "phase-type": "COMPLETED", "start-time": information["phases"][-1]["start-time"]}
+        assert changes[0][1]["detail"]["additional-information"]["build-complete"] is False
+    finally:
+        eb.remove_targets(Rule=rule, Ids=["q"])
+        eb.delete_rule(Name=rule)
+        sqs.delete_queue(QueueUrl=queue_url)
+        codebuild.delete_project(name=project)
 
 
 def test_codebuild_batch_get_builds(codebuild):
@@ -714,6 +775,12 @@ def test_a_build_removes_its_compose_project_when_it_ends(monkeypatch, tmp_path)
     monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
     project = _execution_project()
     build = _seed_execution_build(project, "demo:0013")
+    # The phases an executed build starts with, as StartBuild records them.
+    build["phases"] = [
+        {"phaseType": "SUBMITTED", "phaseStatus": "SUCCEEDED",
+         "startTime": build["startTime"], "endTime": build["startTime"]},
+        {"phaseType": "QUEUED", "startTime": build["startTime"]},
+    ]
 
     codebuild._execute_build("demo:0013", project)
 
@@ -793,6 +860,85 @@ def test_stopped_build_is_not_overwritten_by_the_worker(monkeypatch, tmp_path):
     assert build["currentPhase"] == "COMPLETED"
     # The registry must not leak once the worker is done.
     assert codebuild._stop_requested("demo:0011") is False
+
+
+def _capture_bus(monkeypatch):
+    """The events CodeBuild puts on a bus, in order, as they are dispatched."""
+    from ministack.services import eventbridge
+
+    sent = []
+    monkeypatch.setattr(eventbridge, "_dispatch_event", lambda event, view=None: sent.append(event))
+    return sent
+
+
+def test_an_executed_build_puts_its_end_on_the_default_bus(monkeypatch, tmp_path):
+    """An executed build's end is a CodeBuild Build State Change on the default
+    bus of its own account and region, at the status it ended with, timed at
+    its end, listing the phase that failed."""
+    sent = _capture_bus(monkeypatch)
+    container = _FakeContainer(["Phase complete: BUILD State: FAILED"], exit_code=1)
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: _FakeDocker(container))
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    project = _execution_project()
+    build = _seed_execution_build(project, "demo:0013")
+    # The phases an executed build starts with, as StartBuild records them.
+    build["phases"] = [
+        {"phaseType": "SUBMITTED", "phaseStatus": "SUCCEEDED",
+         "startTime": build["startTime"], "endTime": build["startTime"]},
+        {"phaseType": "QUEUED", "startTime": build["startTime"]},
+    ]
+
+    codebuild._execute_build("demo:0013", project)
+
+    assert [json.loads(e["Detail"])["build-status"] for e in sent] == ["FAILED"]
+    event = sent[0]
+    assert event["Source"] == "aws.codebuild"
+    assert event["DetailType"] == "CodeBuild Build State Change"
+    assert event["EventBusName"] == "default"
+    assert event["Resources"] == [build["arn"]]
+    assert (event["Account"], event["Region"]) == tuple(build["arn"].split(":")[4:2:-1])
+    assert event["Time"] == build["endTime"]
+    detail = json.loads(event["Detail"])
+    assert detail["build-id"] == build["arn"]
+    assert detail["project-name"] == "demo"
+    phases = detail["additional-information"]["phases"]
+    assert [(p["phase-type"], p.get("phase-status")) for p in phases] == [
+        ("SUBMITTED", "SUCCEEDED"), ("QUEUED", "SUCCEEDED"), ("BUILD", "FAILED"), ("COMPLETED", None)]
+
+
+def test_an_executed_build_puts_its_start_on_the_bus_before_it_runs(monkeypatch):
+    """StartBuild puts IN_PROGRESS on the bus before the build can end."""
+    sent = _capture_bus(monkeypatch)
+    monkeypatch.setattr(codebuild, "EXECUTE_BUILDS", True)
+    monkeypatch.setattr(codebuild, "_execute_build",
+                        lambda _bid, _project: sent.append("executed"))
+    codebuild._projects["demo"] = _execution_project()
+
+    codebuild._start_build({"projectName": "demo"})
+
+    deadline = time.time() + 5
+    while "executed" not in sent and time.time() < deadline:
+        time.sleep(0.01)
+    assert sent[-1] == "executed"
+    assert [json.loads(e["Detail"])["build-status"] for e in sent[:-1]] == ["IN_PROGRESS"]
+
+
+def test_a_stopped_build_puts_one_end_on_the_bus(monkeypatch, tmp_path):
+    """StopBuild of an executed build ends it once: the worker reports STOPPED."""
+    sent = _capture_bus(monkeypatch)
+    container = _FakeContainer(["Phase complete: INSTALL State: SUCCEEDED"])
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: _FakeDocker(container))
+    monkeypatch.setattr(codebuild, "_container_for_build", lambda _bid: container)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(codebuild, "EXECUTE_BUILDS", True)
+    project = _execution_project()
+    codebuild._projects["demo"] = project
+    _seed_execution_build(project, "demo:0012")
+
+    codebuild._stop_build({"id": "demo:0012"})
+    codebuild._execute_build("demo:0012", project)
+
+    assert [json.loads(e["Detail"])["build-status"] for e in sent] == ["STOPPED"]
 
 
 def test_execute_build_without_docker_reports_fault(monkeypatch, tmp_path):
