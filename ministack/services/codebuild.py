@@ -11,6 +11,8 @@ Supports:
              UpdateFleet, DeleteFleet
   Builds:    StartBuild, BatchGetBuilds, StopBuild,
              ListBuilds, ListBuildsForProject, BatchDeleteBuilds
+  Events:    CodeBuild Build State Change on the default event bus, as a
+             build starts and as it ends
 
 Builds are metadata-only by default. Set MINISTACK_CODEBUILD_EXECUTE=1 to
 really run them (see "Build execution" below).
@@ -38,6 +40,7 @@ from ministack.core.responses import (
     get_region,
     json_response,
     new_uuid,
+    request_scope,
 )
 
 logger = logging.getLogger("codebuild")
@@ -539,6 +542,114 @@ def _finish_build(build, status):
     build["currentPhase"] = "COMPLETED"
     build["endTime"] = int(time.time())
     _record_phase(build, "COMPLETED", status)
+    _send_build_state_change(build)
+
+
+# ---------------------------------------------------------------------------
+# Build state changes
+#
+# CodeBuild puts a "CodeBuild Build State Change" event on the default event
+# bus of the build's account and region each time a build's status changes:
+# IN_PROGRESS as it starts, then the status it ends with (AWS CodeBuild User
+# Guide, "Build notifications input format reference"). A rule on
+# aws.codebuild is how anything learns that a build ended without polling it.
+# ---------------------------------------------------------------------------
+
+def _notification_time(epoch):
+    """A time inside the event's detail, in the form CodeBuild writes it
+    there: ``Sep 1, 2017 4:12:29 PM``, UTC."""
+    moment = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
+    return (f"{moment:%b} {moment.day}, {moment.year} "
+            f"{(moment.hour % 12) or 12}:{moment:%M:%S} {'AM' if moment.hour < 12 else 'PM'}")
+
+
+def _notification_phase(phase):
+    """One phase of the build as the event lists it. The COMPLETED phase
+    carries its type and start alone; a phase still running has no end and
+    no status yet."""
+    listed = {"phase-type": phase.get("phaseType")}
+    if phase.get("startTime") is not None:
+        listed["start-time"] = _notification_time(phase["startTime"])
+    if phase.get("phaseType") == "COMPLETED" or phase.get("endTime") is None:
+        return listed
+    listed["end-time"] = _notification_time(phase["endTime"])
+    if phase.get("startTime") is not None:
+        listed["duration-in-seconds"] = max(0, int(phase["endTime"] - phase["startTime"]))
+    if phase.get("phaseStatus"):
+        listed["phase-status"] = phase["phaseStatus"]
+    listed["phase-context"] = []
+    return listed
+
+
+def _build_state_change_detail(build, status):
+    env = build.get("environment") or {}
+    logs = build.get("logs") or {}
+    region = parse_arn(build["arn"]).region
+    information = {
+        "build-complete": status != "IN_PROGRESS",
+        "initiator": build.get("initiator", ""),
+        "build-start-time": _notification_time(build.get("startTime") or 0),
+        "source-version": build.get("sourceVersion", ""),
+        "environment": {
+            "image": env.get("image", ""),
+            "privileged-mode": bool(env.get("privilegedMode")),
+            "compute-type": env.get("computeType", ""),
+            "type": env.get("type", ""),
+            "environment-variables": [
+                {"name": var.get("name", ""), "type": var.get("type", "PLAINTEXT"),
+                 "value": var.get("value", "")}
+                for var in env.get("environmentVariables") or []
+            ],
+        },
+        "timeout-in-minutes": build.get("timeoutInMinutes", 60),
+        "logs": {
+            "group-name": logs.get("groupName", ""),
+            "stream-name": logs.get("streamName", ""),
+            "deep-link": (
+                f"https://console.aws.amazon.com/cloudwatch/home?region={region}"
+                f"#logEvent:group={logs.get('groupName', '')};stream={logs.get('streamName', '')}"
+            ),
+        },
+        "phases": [_notification_phase(phase) for phase in build.get("phases") or []],
+    }
+    return {
+        "build-status": status,
+        "project-name": build.get("projectName", ""),
+        "build-id": build["arn"],
+        "additional-information": information,
+        "current-phase": build.get("currentPhase", ""),
+        "current-phase-context": "[]",
+        "version": "1",
+    }
+
+
+def _send_build_state_change(build, status=None):
+    """The build's ``CodeBuild Build State Change``, at ``status`` or the
+    status the build records, on the default bus of the account and region
+    its ARN names. A delivery that fails is logged; it never fails the build
+    or the call that changed it."""
+    status = status or build.get("buildStatus", "")
+    try:
+        spec = parse_arn(build["arn"])
+        ended = status != "IN_PROGRESS"
+        event = {
+            "EventId": new_uuid(),
+            "Source": "aws.codebuild",
+            "DetailType": "CodeBuild Build State Change",
+            "Detail": json.dumps(_build_state_change_detail(build, status)),
+            "EventBusName": "default",
+            "Time": int((build.get("endTime") if ended else None) or build.get("startTime") or time.time()),
+            "Resources": [build["arn"]],
+            "Account": spec.account_id,
+            "Region": spec.region,
+        }
+        from ministack.services import eventbridge as _eb
+
+        with request_scope(spec.account_id, spec.region):
+            _eb._dispatch_event(event)
+    except Exception:
+        logger.exception("CodeBuild -> EventBridge: %s %s was not delivered",
+                         build.get("id"), status)
 
 
 def _timeout_seconds(project):
@@ -1017,6 +1128,12 @@ def _start_build(data):
 
     _builds[bid] = build
     logger.info("StartBuild: %s -> %s", project_name, bid)
+
+    # The start is on the bus before anything can end the build. A build that
+    # is not executed is recorded ended at its start, and its end follows.
+    _send_build_state_change(build, "IN_PROGRESS")
+    if not EXECUTE_BUILDS:
+        _send_build_state_change(build)
 
     if EXECUTE_BUILDS:
         # The stores are scoped by the request's account/region contextvars, so
