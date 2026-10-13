@@ -1978,6 +1978,46 @@ def test_secretsmanager_resource_policies_survive_warm_boot():
     mod.reset()
 
 
+# ── ecr._replication_configurations ────────────────────────────────────
+
+def test_ecr_replication_configurations_survive_warm_boot():
+    """`PutReplicationConfiguration` writes the registry's setting, one per
+    account and region. A warm boot keeps each region's, and a reset clears
+    them all."""
+    import json
+
+    from ministack.core.responses import get_region, set_request_region
+
+    mod = _get_module("ecr")
+    mod.reset()
+    original_region = get_region()
+    east = {"rules": [{"destinations": [{"region": "us-west-2", "registryId": "000000000000"}]}]}
+    west = {"rules": [{"destinations": [{"region": "us-east-1", "registryId": "000000000000"}]}]}
+
+    def described():
+        return json.loads(mod._describe_registry({})[2])["replicationConfiguration"]
+
+    try:
+        set_request_region("us-east-1")
+        assert mod._put_replication_configuration({"replicationConfiguration": east})[0] == 200
+        set_request_region("us-west-2")
+        assert mod._put_replication_configuration({"replicationConfiguration": west})[0] == 200
+
+        _round_trip_dict(mod, "ecr")
+
+        assert described() == west
+        set_request_region("us-east-1")
+        assert described() == east
+
+        mod.reset()
+        assert described() == {"rules": []}
+        set_request_region("us-west-2")
+        assert described() == {"rules": []}
+    finally:
+        set_request_region(original_region)
+        mod.reset()
+
+
 # ── kinesis._consumers ─────────────────────────────────────────────────
 
 def test_kinesis_consumers_survive_warm_boot():

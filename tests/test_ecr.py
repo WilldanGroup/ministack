@@ -200,6 +200,35 @@ def test_ecr_describe_registry(ecr):
     assert "replicationConfiguration" in resp
 
 
+def test_ecr_replication_configuration_is_what_describe_registry_reports():
+    """PutReplicationConfiguration writes the registry's one replication
+    setting in its account and region, whole, and DescribeRegistry reports it:
+    another region's registry keeps its own, a rule that names no destination
+    is refused and changes nothing, and an empty rule list clears it."""
+    home = _ecr_client("eu-central-1")
+    other = _ecr_client("eu-north-1")
+    setting = {"rules": [{
+        "destinations": [{"region": "eu-north-1", "registryId": "000000000000"}],
+        "repositoryFilters": [{"filter": "builds", "filterType": "PREFIX_MATCH"}],
+    }]}
+
+    put = home.put_replication_configuration(replicationConfiguration=setting)
+    assert put["replicationConfiguration"] == setting
+    registry = home.describe_registry()
+    assert registry["registryId"] == "000000000000"
+    assert registry["replicationConfiguration"] == setting
+    assert other.describe_registry()["replicationConfiguration"] == {"rules": []}
+
+    with pytest.raises(ClientError) as exc_info:
+        home.put_replication_configuration(
+            replicationConfiguration={"rules": [{"destinations": []}]})
+    assert exc_info.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert home.describe_registry()["replicationConfiguration"] == setting
+
+    home.put_replication_configuration(replicationConfiguration={"rules": []})
+    assert home.describe_registry()["replicationConfiguration"] == {"rules": []}
+
+
 def test_ecr_repositories_are_region_scoped():
     east = _ecr_client("us-east-1")
     west = _ecr_client("us-west-2")

@@ -5930,6 +5930,58 @@ def test_cfn_ecr_repository_rename_deletes_the_old_repository(cfn, ecr):
                 pass
 
 
+def _cfn_ecr_replication_template(region):
+    return json.dumps({
+        "Resources": {"Replication": {
+            "Type": "AWS::ECR::ReplicationConfiguration",
+            "Properties": {"ReplicationConfiguration": {"Rules": [{
+                "Destinations": [{"Region": region, "RegistryId": {"Ref": "AWS::AccountId"}}],
+                "RepositoryFilters": [{"Filter": "builds", "FilterType": "PREFIX_MATCH"}],
+            }]}},
+        }},
+        "Outputs": {
+            "Ref": {"Value": {"Ref": "Replication"}},
+            "RegistryId": {"Value": {"Fn::GetAtt": ["Replication", "RegistryId"]}},
+        },
+    })
+
+
+def _ecr_replication_setting(region):
+    return {"rules": [{
+        "destinations": [{"region": region, "registryId": "000000000000"}],
+        "repositoryFilters": [{"filter": "builds", "filterType": "PREFIX_MATCH"}],
+    }]}
+
+
+def test_cfn_ecr_replication_configuration_is_the_registrys_setting(cfn, ecr):
+    """AWS::ECR::ReplicationConfiguration writes the registry's one setting
+    through PutReplicationConfiguration, and DescribeRegistry reports it in the
+    API's casing: Ref and RegistryId are the account, the registry's id; an
+    update rewrites the setting, and the stack's delete removes it."""
+    stack_name = f"cfn-ecr-repl-{_uuid_mod.uuid4().hex[:8]}"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_ecr_replication_template("us-west-2"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+        assert outputs == {"Ref": "000000000000", "RegistryId": "000000000000"}
+        assert ecr.describe_registry()["replicationConfiguration"] == _ecr_replication_setting("us-west-2")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_ecr_replication_template("eu-west-1"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert ecr.describe_registry()["replicationConfiguration"] == _ecr_replication_setting("eu-west-1")
+
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+        assert ecr.describe_registry()["replicationConfiguration"] == {"rules": []}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_ec2_launch_template(cfn, ec2):
     """CloudFormation should provision and delete an EC2 LaunchTemplate."""
     template = {
