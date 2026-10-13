@@ -30774,6 +30774,136 @@ def test_cfn_appsync_js_pipeline_resolver_runs_its_code(cfn, appsync):
     assert appsync.list_functions(apiId=api_id)["functions"] == []
 
 
+def test_cfn_appsync_schema_and_code_by_s3_location_serve_a_query(cfn, appsync, s3):
+    """A schema, a pipeline function and its resolver that name their schema
+    and code by ``DefinitionS3Location`` and ``CodeS3Location`` hold the
+    objects those locations name, read from S3 as AppSync reads them, and the
+    resolver serves a query through them."""
+    import requests as _rq
+    from conftest import ENDPOINT
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-s3-{suffix}"
+    bucket = f"cfn-appsync-s3-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    schema = "type Query { hello: String }\nschema { query: Query }\n"
+    function_code = (
+        "export function request(ctx) { return { payload: 'from s3, ' + ctx.info.fieldName } }\n"
+        "export function response(ctx) { return ctx.result }\n"
+    )
+    resolver_code = (
+        "export function request(ctx) { return {} }\n"
+        "export function response(ctx) { return ctx.prev.result }\n"
+    )
+    for key, body in (("v1/schema.graphql", schema), ("v1/greet.js", function_code),
+                      ("v1/pipeline.js", resolver_code)):
+        s3.put_object(Bucket=bucket, Key=key, Body=body.encode())
+    api = appsync.create_graphql_api(
+        name=f"s3-location-api-{suffix}", authenticationType="API_KEY")["graphqlApi"]
+    api_id = api["apiId"]
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+    appsync.create_data_source(apiId=api_id, name="NoneSource", type="NONE")
+    runtime = {"Name": "APPSYNC_JS", "RuntimeVersion": "1.0.0"}
+
+    def located(key):
+        return {"Fn::Sub": ["s3://${Bucket}/${Key}", {"Bucket": bucket, "Key": key}]}
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Schema": {
+                "Type": "AWS::AppSync::GraphQLSchema",
+                "Properties": {"ApiId": api_id, "DefinitionS3Location": located("v1/schema.graphql")},
+            },
+            "Greet": {
+                "Type": "AWS::AppSync::FunctionConfiguration",
+                "DependsOn": "Schema",
+                "Properties": {
+                    "ApiId": api_id, "DataSourceName": "NoneSource", "Name": "greet",
+                    "Runtime": runtime, "CodeS3Location": located("v1/greet.js"),
+                },
+            },
+            "Hello": {
+                "Type": "AWS::AppSync::Resolver",
+                "DependsOn": "Schema",
+                "Properties": {
+                    "ApiId": api_id, "TypeName": "Query", "FieldName": "hello",
+                    "Kind": "PIPELINE", "Runtime": runtime,
+                    "PipelineConfig": {"Functions": [{"Fn::GetAtt": ["Greet", "FunctionId"]}]},
+                    "CodeS3Location": located("v1/pipeline.js"),
+                },
+            },
+        },
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        [function] = appsync.list_functions(apiId=api_id)["functions"]
+        assert function["code"] == function_code
+        resolver = appsync.get_resolver(apiId=api_id, typeName="Query", fieldName="hello")["resolver"]
+        assert resolver["code"] == resolver_code
+        introspected = appsync.get_introspection_schema(apiId=api_id, format="SDL")["schema"].read()
+        assert b"hello: String" in introspected
+        answer = _rq.post(f"{ENDPOINT.rstrip('/')}/v1/apis/{api_id}/graphql",
+                          headers={"x-api-key": key, "content-type": "application/json"},
+                          json={"query": "{ hello }"}, timeout=15).json()
+        assert answer.get("data", {}).get("hello") == "from s3, hello", answer
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        appsync.delete_graphql_api(apiId=api_id)
+        for key in ("v1/schema.graphql", "v1/greet.js", "v1/pipeline.js"):
+            s3.delete_object(Bucket=bucket, Key=key)
+        s3.delete_bucket(Bucket=bucket)
+
+
+def test_cfn_appsync_location_naming_no_object_fails_the_resource(cfn, appsync, s3):
+    """A ``CodeS3Location`` or ``DefinitionS3Location`` that names no object
+    fails its resource, the reason naming the location."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket = f"cfn-appsync-gone-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    api_id = appsync.create_graphql_api(
+        name=f"s3-gone-api-{suffix}", authenticationType="API_KEY")["graphqlApi"]["apiId"]
+    appsync.create_data_source(apiId=api_id, name="NoneSource", type="NONE")
+    cases = {
+        "Schema": {
+            "Type": "AWS::AppSync::GraphQLSchema",
+            "Properties": {"ApiId": api_id, "DefinitionS3Location": f"s3://{bucket}/gone.graphql"},
+        },
+        "Greet": {
+            "Type": "AWS::AppSync::FunctionConfiguration",
+            "Properties": {
+                "ApiId": api_id, "DataSourceName": "NoneSource", "Name": "greet",
+                "Runtime": {"Name": "APPSYNC_JS", "RuntimeVersion": "1.0.0"},
+                "CodeS3Location": f"s3://{bucket}/gone.js",
+            },
+        },
+    }
+    try:
+        for logical_id, resource in cases.items():
+            stack_name = f"cfn-appsync-gone-{logical_id.lower()}-{suffix}"
+            cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(
+                {"AWSTemplateFormatVersion": "2010-09-09", "Resources": {logical_id: resource}}))
+            stack = _wait_stack(cfn, stack_name)
+            try:
+                assert stack["StackStatus"] in ("CREATE_FAILED", "ROLLBACK_COMPLETE"), stack
+                events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+                failed = [e for e in events if e["LogicalResourceId"] == logical_id
+                          and e["ResourceStatus"] == "CREATE_FAILED"]
+                assert failed, events
+                location = resource["Properties"].get("CodeS3Location") or \
+                    resource["Properties"]["DefinitionS3Location"]
+                assert location in failed[0]["ResourceStatusReason"], failed[0]
+            finally:
+                cfn.delete_stack(StackName=stack_name)
+                _wait_stack(cfn, stack_name)
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+        s3.delete_bucket(Bucket=bucket)
+
+
 def test_cfn_appsync_data_source_holds_its_configuration_as_the_api_does(cfn, appsync, ddb):
     """A data source a template stands holds its configuration in the API's
     own shape, so a resolver reading through it reaches its table."""

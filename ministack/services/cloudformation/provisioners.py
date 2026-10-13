@@ -6327,6 +6327,34 @@ def _appsync_runtime(props):
     return {"name": runtime["Name"], "runtimeVersion": runtime.get("RuntimeVersion", "1.0.0")}
 
 
+def _appsync_s3_text(resource_type, prop, location):
+    """The text an AppSync ``*S3Location`` names, ``s3://<bucket>/<key>``,
+    read from this emulator's own S3, as AppSync reads it when the resource is
+    created or updated (aws-resource-appsync-functionconfiguration,
+    -resolver, -graphqlschema: ``CodeS3Location``, ``DefinitionS3Location``).
+    A location that is no ``s3://`` address, or that names no object, fails
+    the resource naming it."""
+    if not isinstance(location, str) or not location.startswith("s3://"):
+        raise ValueError(f"{resource_type} {prop} {location!r} is not an s3://<bucket>/<key> location")
+    bucket, _, key = location[len("s3://"):].partition("/")
+    if not bucket or not key:
+        raise ValueError(f"{resource_type} {prop} {location} names no bucket and key")
+    blob = _s3._get_object_data(bucket, key)
+    if blob is None:
+        raise ValueError(f"{resource_type} {prop} names {location}, which holds no object")
+    return blob.decode("utf-8")
+
+
+def _appsync_code(resource_type, props):
+    """A function's or resolver's code: inline ``Code``, or the object its
+    ``CodeS3Location`` names where it carries none."""
+    if props.get("Code") is not None:
+        return props["Code"]
+    if props.get("CodeS3Location"):
+        return _appsync_s3_text(resource_type, "CodeS3Location", props["CodeS3Location"])
+    return None
+
+
 def _appsync_function_body(props):
     """The function a template declares, in the shape CreateFunction takes."""
     body = {
@@ -6340,8 +6368,9 @@ def _appsync_function_body(props):
     runtime = _appsync_runtime(props)
     if runtime:
         body["runtime"] = runtime
-    if props.get("Code") is not None:
-        body["code"] = props["Code"]
+    code = _appsync_code("AWS::AppSync::FunctionConfiguration", props)
+    if code is not None:
+        body["code"] = code
     if props.get("MaxBatchSize") is not None:
         body["maxBatchSize"] = int(props["MaxBatchSize"])
     return body
@@ -6400,8 +6429,9 @@ def _appsync_resolver_create(logical_id, props, stack_name):
     runtime = _appsync_runtime(props)
     if runtime:
         resolver["runtime"] = runtime
-    if props.get("Code") is not None:
-        resolver["code"] = props["Code"]
+    code = _appsync_code("AWS::AppSync::Resolver", props)
+    if code is not None:
+        resolver["code"] = code
     pipeline = props.get("PipelineConfig")
     if isinstance(pipeline, dict):
         resolver["pipelineConfig"] = {"functions": list(pipeline.get("Functions") or [])}
@@ -6419,7 +6449,12 @@ def _appsync_resolver_delete(physical_id, props):
 
 def _appsync_schema_create(logical_id, props, stack_name):
     api_id = props.get("ApiId", "")
-    definition = props.get("Definition", "")
+    definition = props.get("Definition")
+    if definition is None and props.get("DefinitionS3Location"):
+        definition = _appsync_s3_text(
+            "AWS::AppSync::GraphQLSchema", "DefinitionS3Location", props["DefinitionS3Location"])
+    if definition is None:
+        definition = ""
     _appsync._types.setdefault(api_id, {})["__schema__"] = {
         "typeName": "__schema__", "definition": definition, "format": "SDL",
     }
