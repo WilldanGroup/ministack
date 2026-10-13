@@ -6058,6 +6058,27 @@ def _appsync_api_tags(props):
                      if isinstance(t, dict) and not str(t.get("Key", "")).startswith("aws:")]}
 
 
+def _appsync_api_attrs(api):
+    """The attributes Fn::GetAtt reads off an API, GraphQLEndpointArn among them.
+
+    The endpoint ARN is what an EventBridge rule's AppSync target names: AWS
+    forms it from the prefix of the API's GraphQL host, not from its id
+    (``arn:aws:appsync:<region>:<account>:endpoints/graphql-api/<prefix>``,
+    aws-resource-appsync-graphqlapi, Return values). The host here is the one
+    GraphQLUrl already answers, so the two cannot disagree.
+    """
+    url = api["uris"]["GRAPHQL"]
+    prefix = url.split("://", 1)[1].split(".", 1)[0]
+    return {
+        "ApiId": api["apiId"],
+        "Arn": api["arn"],
+        "GraphQLUrl": url,
+        "GraphQLEndpointArn": (
+            f"arn:aws:appsync:{get_region()}:{get_account_id()}:endpoints/graphql-api/{prefix}"
+        ),
+    }
+
+
 def _appsync_api_create(logical_id, props, stack_name):
     import time as _time
     name = props.get("Name") or _physical_name(stack_name, logical_id)
@@ -6082,7 +6103,7 @@ def _appsync_api_create(logical_id, props, stack_name):
     _appsync._data_sources[api_id] = {}
     _appsync._resolvers[api_id] = {}
     _appsync._types[api_id] = {}
-    return api_id, {"ApiId": api_id, "Arn": arn, "GraphQLUrl": f"https://{api_id}.appsync-api.{get_region()}.amazonaws.com/graphql"}
+    return api_id, _appsync_api_attrs(_appsync._apis[api_id])
 
 
 def _appsync_api_update(physical_id, old_props, new_props, stack_name, logical_id=None):
@@ -6108,11 +6129,7 @@ def _appsync_api_update(physical_id, old_props, new_props, stack_name, logical_i
     if not tags:
         _appsync._tags.pop(api["arn"], None)
     api["lastUpdatedAt"] = time.time()
-    return physical_id, {
-        "ApiId": physical_id,
-        "Arn": api["arn"],
-        "GraphQLUrl": api["uris"]["GRAPHQL"],
-    }
+    return physical_id, _appsync_api_attrs(api)
 
 
 def _appsync_api_delete(physical_id, props):
