@@ -7228,6 +7228,52 @@ def _ecr_repo_delete(physical_id, props):
         raise ValueError(json.loads(body).get("message", body))
 
 
+# --- ECR ReplicationConfiguration provisioner ---
+#
+# The registry's one replication setting per account and region, written
+# through PutReplicationConfiguration as ECR's API writes it and reported by
+# DescribeRegistry. Nothing is replicated, as a global table's replicas copy
+# nothing: replication is the service's own guarantee, proven against AWS.
+# Ref and RegistryId are the account, the registry's id, as on AWS
+# (aws-resource-ecr-replicationconfiguration); the delete removes the setting.
+
+def _ecr_replication_api(props):
+    """The CloudFormation ReplicationConfiguration in the API's casing."""
+    rules = []
+    for rule in (props.get("ReplicationConfiguration") or {}).get("Rules") or []:
+        api = {"destinations": [
+            {"region": d.get("Region"), "registryId": d.get("RegistryId")}
+            for d in rule.get("Destinations") or []
+        ]}
+        if rule.get("RepositoryFilters"):
+            api["repositoryFilters"] = [
+                {"filter": f.get("Filter"), "filterType": f.get("FilterType")}
+                for f in rule["RepositoryFilters"]
+            ]
+        rules.append(api)
+    return {"rules": rules}
+
+
+def _ecr_replication_create(logical_id, props, stack_name):
+    status, _, body = _ecr._put_replication_configuration(
+        {"replicationConfiguration": _ecr_replication_api(props)}
+    )
+    if status >= 400:
+        raise ValueError(
+            f"AWS::ECR::ReplicationConfiguration PutReplicationConfiguration failed: {body!r}"
+        )
+    registry = get_account_id()
+    return registry, {"RegistryId": registry}
+
+
+def _ecr_replication_update(physical_id, old_props, new_props, stack_name):
+    return _ecr_replication_create(physical_id, new_props, stack_name)
+
+
+def _ecr_replication_delete(physical_id, props):
+    _ecr._replication_configurations.pop(physical_id, None)
+
+
 # --- CodeBuild Project provisioner ---
 
 def _codebuild_members(value):
@@ -13360,6 +13406,11 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
     "AWS::ECR::Repository": {"create": _ecr_repo_create, "update": _ecr_repo_update, "delete": _ecr_repo_delete},
+    "AWS::ECR::ReplicationConfiguration": {
+        "create": _ecr_replication_create,
+        "update": _ecr_replication_update,
+        "delete": _ecr_replication_delete,
+    },
     "AWS::CertificateManager::Certificate": {
         "create": _acm_certificate_create,
         "update": _acm_certificate_update,

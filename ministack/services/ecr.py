@@ -42,6 +42,12 @@ _repo_policies = AccountRegionScopedDict()
 _layer_blobs = AccountRegionScopedDict()
 _manifest_blobs = AccountRegionScopedDict()
 _uploads = AccountRegionScopedDict()
+# The registry's replication setting, one per account and region, keyed by
+# the registry's id, as PutReplicationConfiguration writes it and
+# DescribeRegistry reports it. Recorded and never acted on: no image is
+# copied between regions, as a global table's replicas copy nothing here, and
+# replication is the service's own guarantee.
+_replication_configurations = AccountRegionScopedDict()
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -54,6 +60,7 @@ def get_state():
         "repo_policies": copy.deepcopy(_repo_policies),
         "layer_blobs": copy.deepcopy(_layer_blobs),
         "manifest_blobs": copy.deepcopy(_manifest_blobs),
+        "replication_configurations": copy.deepcopy(_replication_configurations),
         # _uploads is intentionally NOT persisted — in-flight upload sessions
         # do not survive a restart, matching real registry behaviour where
         # the client retries the upload from scratch after a 404 on PATCH.
@@ -87,6 +94,7 @@ def _restore_state(data):
         }
 
     _repositories.update(restored_repositories)
+    _replication_configurations.update(data.get("replication_configurations", {}))
     for store, key in (
         (_images, "images"),
         (_lifecycle_policies, "lifecycle_policies"),
@@ -171,6 +179,7 @@ async def handle_request(method, path, headers, body, query_params):
         "PutImageTagMutability": _put_image_tag_mutability,
         "PutImageScanningConfiguration": _put_image_scanning_configuration,
         "DescribeRegistry": _describe_registry,
+        "PutReplicationConfiguration": _put_replication_configuration,
         "GetDownloadUrlForLayer": _get_download_url_for_layer,
         "BatchCheckLayerAvailability": _batch_check_layer_availability,
         "InitiateLayerUpload": _initiate_layer_upload,
@@ -579,8 +588,35 @@ def _put_image_scanning_configuration(data):
 def _describe_registry(data):
     return json_response({
         "registryId": _registry_id(),
-        "replicationConfiguration": {"rules": []},
+        "replicationConfiguration": copy.deepcopy(
+            _replication_configurations.get(_registry_id(), {"rules": []})
+        ),
     })
+
+
+def _put_replication_configuration(data):
+    """The registry's replication setting in this account and region, written
+    whole as the API writes it: rules, each naming the destinations it
+    replicates to by region and registry. Recorded and answered by
+    DescribeRegistry; nothing is replicated."""
+    config = data.get("replicationConfiguration")
+    rules = config.get("rules") if isinstance(config, dict) else None
+    if not isinstance(rules, list):
+        return error_response_json(
+            "InvalidParameterException", "replicationConfiguration.rules is required", 400)
+    for rule in rules:
+        destinations = rule.get("destinations") if isinstance(rule, dict) else None
+        if not isinstance(destinations, list) or not destinations or not all(
+            isinstance(d, dict) and d.get("region") and d.get("registryId")
+            for d in destinations
+        ):
+            return error_response_json(
+                "InvalidParameterException",
+                "every replication rule names its destinations, each by region and registryId",
+                400,
+            )
+    _replication_configurations[_registry_id()] = copy.deepcopy(config)
+    return json_response({"replicationConfiguration": copy.deepcopy(config)})
 
 
 def _get_download_url_for_layer(data):
@@ -700,6 +736,7 @@ def reset():
     _layer_blobs.clear()
     _manifest_blobs.clear()
     _uploads.clear()
+    _replication_configurations.clear()
 
 
 # ──────────────────────────────────────────────────────────────────────────
