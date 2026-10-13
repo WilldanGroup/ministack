@@ -1676,6 +1676,11 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("cloudformation", "POST", "/", {}, b"", {"StackName": ["my-stack"]}, "us-east-1", "123") == "arn:aws:cloudformation:us-east-1:123:stack/my-stack/*"
 
+    def test_cloudformation_stack_set_that_does_not_stand(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("cloudformation", "POST", "/", {}, b"", {"StackSetName": ["my-set"]}, "us-east-1", "123") == "arn:aws:cloudformation:us-east-1:123:stackset/my-set:*"
+        assert extract_resource_arn("cloudformation", "POST", "/", {}, b"", {"StackSetName": ["my-set:0f3c"]}, "us-east-1", "123") == "arn:aws:cloudformation:us-east-1:123:stackset/my-set:0f3c"
+
     def test_ssm_parameter(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("ssm", "POST", "/", {}, b"", {"Name": ["/app/config"]}, "us-east-1", "123") == "arn:aws:ssm:us-east-1:123:parameter/app/config"
@@ -3800,6 +3805,160 @@ class TestCloudFormationStackResourceTags:
         status, _, body = self._dispatch(session, "DescribeStacks", {"StackName": stack_id})
         assert status == 200, body
 
+
+class TestCloudFormationStackSetResourceTags:
+    """A call naming a stack set is checked against the stack set's ARN,
+    ``stackset/<name>:<id>``, carrying its tags as the aws:ResourceTag/<key>
+    condition keys, as AWS checks it. Before, a request naming no StackName
+    was checked against ``*``, so no grant on ``stackset/*`` admitted any
+    stack set call and a role holding one was refused every read and update
+    of the stack set it was granted."""
+
+    _ACCOUNT = "000000000000"
+    _REGION = "us-east-1"
+    _ROLE = "cfn-stack-set-tag-probe"
+    _SESSION = "ASIACFNSTACKSETTAG01"
+    _ACTIONS = [
+        "cloudformation:DescribeStackSet",
+        "cloudformation:UpdateStackSet",
+        "cloudformation:ListStackSetOperations",
+        "cloudformation:DescribeStackSetOperation",
+        "cloudformation:ListStackSetOperationResults",
+    ]
+
+    _dispatch = staticmethod(TestCloudFormationStackResourceTags._dispatch)
+
+    @pytest.fixture
+    def world(self, monkeypatch):
+        """Stack sets made as root, and one role's session to call as."""
+        import types
+
+        import ministack.app as app
+        from ministack.services import iam as iam_svc
+        from ministack.services import sts as sts_svc
+        from ministack.services.cloudformation.stacksets import _operations, _stack_sets
+
+        monkeypatch.setattr(app, "AUTH", True)
+        names = []
+
+        def stack_set(name, tags):
+            template = {"Resources": {"Topic": {"Type": "AWS::SNS::Topic"}}}
+            params = {"StackSetName": name, "TemplateBody": json.dumps(template)}
+            for index, (key, value) in enumerate(tags.items(), start=1):
+                params[f"Tags.member.{index}.Key"] = key
+                params[f"Tags.member.{index}.Value"] = value
+            status, _, body = self._dispatch("test", "CreateStackSet", params)
+            assert status == 200, body
+            names.append(name)
+            return _stack_sets.get_scoped(self._ACCOUNT, self._REGION, name)
+
+        def role(statements):
+            iam_svc._roles[self._ROLE] = {
+                "RoleName": self._ROLE,
+                "Arn": f"arn:aws:iam::{self._ACCOUNT}:role/{self._ROLE}",
+                "RoleId": "AROACFNSTACKSETTAG", "CreateDate": "2026-01-01", "Path": "/",
+                "AssumeRolePolicyDocument": "{}", "AttachedPolicies": [], "Tags": [],
+                "InlinePolicies": {"stack-sets": json.dumps({"Statement": statements})},
+            }
+            sts_svc.register_session(self._SESSION, {
+                "Arn": f"arn:aws:sts::{self._ACCOUNT}:assumed-role/{self._ROLE}/probe",
+                "UserId": "AROACFNSTACKSETTAG:probe",
+                "SecretAccessKey": "s", "SessionToken": "t",
+                "Expiration": time.time() + 3600,
+                "AccountId": self._ACCOUNT, "PrincipalType": "AssumedRole",
+                "SourceAccessKeyId": "test",
+                "SourcePrincipalArn": f"arn:aws:iam::{self._ACCOUNT}:root",
+            })
+            return self._SESSION
+
+        try:
+            yield types.SimpleNamespace(stack_set=stack_set, role=role)
+        finally:
+            sts_svc._sessions.pop(self._SESSION, None)
+            iam_svc._roles.pop(self._ROLE, None)
+            for operation_id, operation in list(_operations.items()):
+                if operation["_stack_set"] in names:
+                    _operations.pop(operation_id, None)
+            for name in names:
+                _stack_sets.pop(name, None)
+
+    def _tagged(self, condition=None):
+        """The stack set calls on any stack set of the account that carries
+        ``swb:tenant``, as a connected account's SwitchboardAccess grants them."""
+        return {
+            "Effect": "Allow", "Action": self._ACTIONS,
+            "Resource": f"arn:aws:cloudformation:*:{self._ACCOUNT}:stackset/*:*",
+            "Condition": condition or {"StringLike": {"aws:ResourceTag/swb:tenant": "*"}},
+        }
+
+    @staticmethod
+    def _operation_id(body):
+        import re
+
+        match = re.search(rb"<OperationId>([^<]+)</OperationId>", body)
+        assert match, body
+        return match.group(1).decode()
+
+    def test_a_tag_bounded_grant_reads_and_updates_a_stack_set_carrying_the_tag(self, world):
+        world.stack_set("cfn-set-owned", {"swb:tenant": "platform"})
+        session = world.role([self._tagged()])
+
+        status, _, body = self._dispatch(session, "DescribeStackSet", {"StackSetName": "cfn-set-owned"})
+        assert status == 200, body
+        assert b"cfn-set-owned" in body
+        status, _, body = self._dispatch(
+            session, "UpdateStackSet",
+            {"StackSetName": "cfn-set-owned", "UsePreviousTemplate": "true"})
+        assert status == 200, body
+        operation = {"StackSetName": "cfn-set-owned", "OperationId": self._operation_id(body)}
+        for action in ("DescribeStackSetOperation", "ListStackSetOperationResults"):
+            status, _, body = self._dispatch(session, action, operation)
+            assert status == 200, (action, body)
+        status, _, body = self._dispatch(
+            session, "ListStackSetOperations", {"StackSetName": "cfn-set-owned"})
+        assert status == 200, body
+        assert operation["OperationId"].encode() in body
+
+    def test_a_tag_bounded_grant_refuses_a_stack_set_without_the_tag(self, world):
+        world.stack_set("cfn-set-foreign", {"owner": "someone-else"})
+        session = world.role([self._tagged()])
+
+        status, _, body = self._dispatch(
+            session, "DescribeStackSet", {"StackSetName": "cfn-set-foreign"})
+        assert status == 403, body
+        assert b"AccessDenied" in body and b"cloudformation:DescribeStackSet" in body
+
+    def test_a_tag_bounded_grant_refuses_a_stack_set_that_does_not_stand(self, world):
+        session = world.role([self._tagged()])
+
+        status, _, body = self._dispatch(
+            session, "DescribeStackSet", {"StackSetName": "cfn-set-absent"})
+        assert status == 403, body
+
+    def test_a_grant_on_the_tag_value_reads_the_stack_set_named_by_its_id(self, world):
+        stack_set = world.stack_set("cfn-set-by-id", {"swb:tenant": "platform"})
+        session = world.role([self._tagged(
+            {"StringEquals": {"aws:ResourceTag/swb:tenant": "platform"}})])
+
+        status, _, body = self._dispatch(
+            session, "DescribeStackSet", {"StackSetName": stack_set["StackSetId"]})
+        assert status == 200, body
+
+    def test_a_grant_on_one_stack_set_refuses_another(self, world):
+        world.stack_set("cfn-set-granted", {})
+        world.stack_set("cfn-set-other", {})
+        session = world.role([{
+            "Effect": "Allow", "Action": "cloudformation:DescribeStackSet",
+            "Resource": f"arn:aws:cloudformation:{self._REGION}:{self._ACCOUNT}"
+                        ":stackset/cfn-set-granted:*",
+        }])
+
+        status, _, body = self._dispatch(
+            session, "DescribeStackSet", {"StackSetName": "cfn-set-granted"})
+        assert status == 200, body
+        status, _, body = self._dispatch(
+            session, "DescribeStackSet", {"StackSetName": "cfn-set-other"})
+        assert status == 403, body
 
 def test_lambda_create_function_with_a_missing_role_answers_400(monkeypatch):
     """The role check must reach the client, not blow up inside _build_config."""

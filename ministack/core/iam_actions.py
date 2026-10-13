@@ -1205,6 +1205,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         change_set = _query_param(query_params, "ChangeSetName")
         if change_set.startswith("arn:"):
             return cloudformation_change_set_stack_arn(change_set, region)
+        stack_set = _query_param(query_params, "StackSetName")
+        if stack_set:
+            return cloudformation_stack_set_arn(stack_set, region, account_id)
         return "*"
 
     if service == "monitoring":
@@ -1762,21 +1765,62 @@ def cloudformation_change_set_stack_arn(change_set_arn: str, region: str) -> str
     return "*"
 
 
+def cloudformation_stack_set_arn(stack_set: str, region: str, account_id: str) -> str:
+    """The ARN of the stack set a request names by ``StackSetName``.
+
+    AWS authorizes the stack set calls (DescribeStackSet, UpdateStackSet,
+    DeleteStackSet, the stack instance calls, DescribeStackSetOperation,
+    ListStackSetOperations, ListStackSetOperationResults) on the stack set,
+    ``stackset/<name>:<id>`` in the CloudFormation service authorization
+    reference, and the API takes the stack set's name or its id,
+    ``<name>:<id>``. The stack set is looked up and its ARN returned. One that
+    does not stand, the one CreateStackSet is about to make among them, is
+    ``stackset/<name>:*``, as a stack not yet stood is ``stack/<name>/*``.
+    """
+    from ministack.services.cloudformation.stacksets import _stack_sets
+
+    if stack_set.startswith("arn:"):
+        return stack_set
+    found = _stack_sets.get_scoped(account_id, region, stack_set)
+    if found is None:
+        found = next((candidate for candidate in _stack_sets.values_scoped(account_id, region)
+                      if candidate.get("StackSetId") == stack_set), None)
+    if isinstance(found, dict) and found.get("StackSetARN"):
+        return found["StackSetARN"]
+    stack_set_id = stack_set if ":" in stack_set else f"{stack_set}:*"
+    return f"arn:aws:cloudformation:{region}:{account_id}:stackset/{stack_set_id}"
+
+
+def _resource_tag_keys(tags) -> dict:
+    return {
+        f"aws:ResourceTag/{tag['Key']}": tag.get("Value", "")
+        for tag in tags or []
+        if isinstance(tag, dict) and "Key" in tag
+    }
+
+
 def cloudformation_service_context(resource_arn: str) -> dict:
-    """The tags of the stack a check against ``resource_arn`` names, as the
-    ``aws:ResourceTag/<key>`` condition keys AWS supplies for a stack.
+    """The tags of the stack or stack set a check against ``resource_arn``
+    names, as the ``aws:ResourceTag/<key>`` condition keys AWS supplies for
+    each.
 
     A stack ARN is ``stack/<name>/<id>``, or ``stack/<name>/*`` where the
-    request named the stack. A stack that does not stand carries none: the
-    stack a request is about to create is not yet a resource with tags, so a
-    statement bounded by its tags does not match it, as in AWS.
+    request named the stack; a stack set ARN is ``stackset/<name>:<id>``, or
+    ``stackset/<name>:*`` for one that does not stand. A stack or stack set
+    that does not stand carries none: the one a request is about to create is
+    not yet a resource with tags, so a statement bounded by its tags does not
+    match it, as in AWS.
     """
     from ministack.services.cloudformation import _stacks
 
     parts = resource_arn.split(":", 5)
-    if len(parts) != 6 or parts[2] != "cloudformation" or not parts[5].startswith("stack/"):
+    if len(parts) != 6 or parts[2] != "cloudformation":
         return {}
     _, _, _, region, account_id, resource = parts
+    if resource.startswith("stackset/"):
+        return _cloudformation_stack_set_tags(account_id, region, resource[len("stackset/"):])
+    if not resource.startswith("stack/"):
+        return {}
     segments = resource.split("/")
     if len(segments) < 2:
         return {}
@@ -1786,11 +1830,19 @@ def cloudformation_service_context(resource_arn: str) -> dict:
                       if candidate.get("StackId") == resource_arn), None)
     if not isinstance(stack, dict) or stack.get("StackStatus") == "DELETE_COMPLETE":
         return {}
-    return {
-        f"aws:ResourceTag/{tag['Key']}": tag.get("Value", "")
-        for tag in stack.get("Tags") or []
-        if isinstance(tag, dict) and "Key" in tag
-    }
+    return _resource_tag_keys(stack.get("Tags"))
+
+
+def _cloudformation_stack_set_tags(account_id: str, region: str, stack_set_id: str) -> dict:
+    """The tags of the stack set whose id is ``stack_set_id``, ``<name>:<id>``,
+    as condition keys; none for one that does not stand, or for a stack set
+    stood again under the name since the id was given."""
+    from ministack.services.cloudformation.stacksets import _stack_sets
+
+    stack_set = _stack_sets.get_scoped(account_id, region, stack_set_id.split(":", 1)[0])
+    if not isinstance(stack_set, dict) or stack_set.get("StackSetId") != stack_set_id:
+        return {}
+    return _resource_tag_keys(stack_set.get("Tags"))
 
 
 def eventbridge_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
