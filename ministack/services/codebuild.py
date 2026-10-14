@@ -28,6 +28,7 @@ import os
 import platform
 import re
 import secrets
+import shutil
 import threading
 import time
 
@@ -205,10 +206,13 @@ def _make_build_record(project, build_id, source_version=None):
 # emulator reimplementing an executor.
 #
 # WORKSPACE must resolve to the same path on the host and in this container,
-# because the agent bind-mounts it into the build container:
+# because the agent bind-mounts it into the build container. It is handed in as
+# MINISTACK_CODEBUILD_WORKSPACE, so two MiniStacks on one Docker daemon each
+# hand the agent a folder of their own:
 #   docker run -p 4566:4566 \
 #     -v /var/run/docker.sock:/var/run/docker.sock \
 #     -v /tmp/ministack-codebuild:/tmp/ministack-codebuild \
+#     -e MINISTACK_CODEBUILD_WORKSPACE=/tmp/ministack-codebuild \
 #     -e MINISTACK_CODEBUILD_EXECUTE=1 ministackorg/ministack
 # ---------------------------------------------------------------------------
 
@@ -270,9 +274,11 @@ def _architecture_refusal(project, environment_type_override=None):
             f"and this emulator's host is {HOST_ARCHITECTURE}: a build runs on a host of its "
             f"own architecture and is not emulated")
 
-# Internal scratch space for the source/artifacts/env files handed to the
-# agent container; not an AWS concept, so not configurable.
-WORKSPACE = "/tmp/ministack-codebuild"
+# Scratch space for the source/artifacts/env files handed to the agent
+# container, one folder per build, which the build's end removes. Not an AWS
+# concept: its one setting is where it is, which must be the same path on the
+# host (above), and which is this MiniStack's own where several share a daemon.
+WORKSPACE = os.environ.get("MINISTACK_CODEBUILD_WORKSPACE") or "/tmp/ministack-codebuild"
 
 # Extra `docker run` flags for the AGENT container, with the same syntax and the
 # same parser as LAMBDA_DOCKER_FLAGS.
@@ -713,6 +719,22 @@ def _timeout_seconds(project):
     return max(1, minutes) * 60
 
 
+def _remove_workdir(build_id, workdir):
+    """Remove one build's folder under WORKSPACE once the build has ended.
+
+    The agent and the build write into it as the build container's user, which
+    need not be the host user who owns WORKSPACE, so this MiniStack removes it
+    rather than leaving it for the host. Best effort: a build's end must not
+    fail over its cleanup."""
+    try:
+        shutil.rmtree(workdir)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.warning("Could not remove the working folder of build %s, %s: %s",
+                       build_id, workdir, exc)
+
+
 def _execute_build(build_id, project):
     """Run a build through the CodeBuild local agent; update its record live."""
     build = _builds.get(build_id)
@@ -738,6 +760,7 @@ def _execute_build(build_id, project):
         if not buildspec.strip():
             logger.error("Build %s has no inline buildspec to execute", build_id)
             _finish_build(build, "FAILED")
+            _remove_workdir(build_id, workdir)
             return
 
         buildspec_path = os.path.join(source_dir, "buildspec.yml")
@@ -794,6 +817,7 @@ def _execute_build(build_id, project):
         logger.exception("Failed to start build %s", build_id)
         _withdraw_build_session(build_id)
         _finish_build(build, "FAULT")
+        _remove_workdir(build_id, workdir)
         return
 
     try:
@@ -882,6 +906,8 @@ def _execute_build(build_id, project):
         # After the agent: one stopped or timed out mid-build leaves its
         # project's containers running, and they hold the volumes.
         _remove_compose_project(client, compose_project)
+        # Last: nothing that could still write into the folder is running.
+        _remove_workdir(build_id, workdir)
 
 
 # ---------------------------------------------------------------------------
