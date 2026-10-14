@@ -1,8 +1,13 @@
 import json
 import os
+import shutil
+import subprocess
+import sys
 import threading
 import time
 import uuid
+
+from pathlib import Path
 
 import boto3
 import pytest
@@ -376,6 +381,11 @@ class _FakeContainers:
     def run(self, image, **kwargs):
         self.image = image
         self.kwargs = kwargs
+        # The build's folder as the agent is handed it, copied while the build
+        # runs: the build's end removes the folder itself.
+        workdir = os.path.dirname(os.path.dirname(kwargs["environment"]["BUILDSPEC"]))
+        self.handed = workdir + ".handed"
+        shutil.copytree(workdir, self.handed)
         return self._container
 
 
@@ -596,12 +606,12 @@ def test_execute_build_records_phases_from_agent_log(monkeypatch, tmp_path):
     assert docker.containers.kwargs["environment"]["DOCKER_PRIVILEGED_MODE"] == "true"
     assert container.removed is True
 
-    buildspec_path = docker.containers.kwargs["environment"]["BUILDSPEC"]
-    assert os.path.isfile(buildspec_path)
-    with open(buildspec_path, encoding="utf-8") as fh:
+    assert docker.containers.kwargs["environment"]["BUILDSPEC"] == os.path.join(
+        str(tmp_path), "demo_0001", "src", "buildspec.yml")
+    with open(os.path.join(docker.containers.handed, "src", "buildspec.yml"), encoding="utf-8") as fh:
         assert fh.read() == EXECUTION_BUILDSPEC
 
-    env_file = os.path.join(str(tmp_path), "demo_0001", "env", "env.list")
+    env_file = os.path.join(docker.containers.handed, "env", "env.list")
     with open(env_file, encoding="utf-8") as fh:
         env_lines = fh.read().splitlines()
     assert "FOO=bar" in env_lines
@@ -660,6 +670,70 @@ def test_execute_build_without_buildspec_never_starts_agent(monkeypatch, tmp_pat
 
     assert build["buildStatus"] == "FAILED"
     assert docker.containers.image is None
+
+
+def test_the_workspace_is_the_folder_handed_in():
+    """MINISTACK_CODEBUILD_WORKSPACE names the folder the agent is handed, so
+    MiniStacks sharing one Docker daemon each hand their own; unset, it is
+    /tmp/ministack-codebuild."""
+    def workspace(env):
+        return subprocess.run(
+            [sys.executable, "-c", "from ministack.services import codebuild; print(codebuild.WORKSPACE)"],
+            env=env, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    base = {k: v for k, v in os.environ.items() if k != "MINISTACK_CODEBUILD_WORKSPACE"}
+
+    assert workspace({**base, "MINISTACK_CODEBUILD_WORKSPACE": "/tmp/ministack-codebuild-14566"}) \
+        == "/tmp/ministack-codebuild-14566"
+    assert workspace(base) == "/tmp/ministack-codebuild"
+
+
+def test_a_build_works_in_the_workspace_and_its_end_removes_its_folder(monkeypatch, tmp_path):
+    """The agent is handed a folder of the build's own under the workspace, and
+    the build's end removes it, whatever the build container wrote there, so
+    nothing a finished build left stands in the way of removing the workspace."""
+    workspace = tmp_path / "workspace"
+    container = _FakeContainer(["Phase complete: BUILD State: SUCCEEDED"])
+    docker = _FakeDocker(container)
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: docker)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(workspace))
+    project = _execution_project()
+    build = _seed_execution_build(project, "demo:0014")
+
+    codebuild._execute_build("demo:0014", project)
+
+    workdir = workspace / "demo_0014"
+    handed = docker.containers.kwargs
+    assert handed["environment"]["SOURCE"] == str(workdir / "src")
+    assert handed["environment"]["ARTIFACTS"] == str(workdir / "artifacts")
+    assert os.path.isfile(os.path.join(docker.containers.handed, "env", "env.list"))
+    assert build["buildStatus"] == "SUCCEEDED"
+    assert not workdir.exists()
+
+
+class _UnstartableContainers(_FakeContainers):
+    def run(self, image, **kwargs):
+        raise RuntimeError("the daemon refused the agent")
+
+
+@pytest.mark.parametrize("buildspec, starts, status", [
+    ("", True, "FAILED"),
+    (EXECUTION_BUILDSPEC, False, "FAULT"),
+], ids=["no buildspec", "the agent never starts"])
+def test_a_build_the_agent_never_ran_removes_its_folder(monkeypatch, tmp_path, buildspec, starts, status):
+    docker = _FakeDocker(_FakeContainer([]))
+    if not starts:
+        docker.containers = _UnstartableContainers(_FakeContainer([]))
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: docker)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    project = _execution_project(buildspec=buildspec)
+    build = _seed_execution_build(project, "demo:0015")
+
+    codebuild._execute_build("demo:0015", project)
+
+    assert build["buildStatus"] == status
+    assert not (tmp_path / "demo_0015").exists()
 
 
 def test_execute_build_times_out_per_project_timeout(monkeypatch, tmp_path):
@@ -754,7 +828,8 @@ def test_env_file_hands_the_build_its_role_session(monkeypatch, tmp_path):
 
 def test_a_finished_build_no_longer_answers_its_session(monkeypatch, tmp_path):
     container = _FakeContainer(["Phase complete: BUILD State: SUCCEEDED"])
-    monkeypatch.setattr(codebuild, "_get_docker", lambda: _FakeDocker(container))
+    docker = _FakeDocker(container)
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: docker)
     monkeypatch.setattr(codebuild, "_aws_endpoint", lambda: "http://172.17.0.1:4566")
     monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
     project = _execution_project()
@@ -762,7 +837,7 @@ def test_a_finished_build_no_longer_answers_its_session(monkeypatch, tmp_path):
 
     codebuild._execute_build("demo:0011", project)
 
-    env = _env(tmp_path / "demo_0011" / "env" / "env.list")
+    env = _env(Path(docker.containers.handed) / "env" / "env.list")
     status, _answer = _get_credentials(env["AWS_CONTAINER_CREDENTIALS_FULL_URI"])
     assert status == 404
 
@@ -804,7 +879,7 @@ def test_the_build_service_reaches_the_host_by_name(monkeypatch, tmp_path):
     codebuild._execute_build("demo:0012", project)
 
     mounted = {bind["bind"]: source for source, bind in docker.containers.kwargs["volumes"].items()}
-    wrapper = mounted["/usr/local/sbin/docker-compose"]
+    wrapper = os.path.join(docker.containers.handed, os.path.basename(mounted["/usr/local/sbin/docker-compose"]))
     assert os.access(wrapper, os.X_OK)
     if not _gnu_sed():
         pytest.skip("the wrapper runs in the agent's image, whose sed is GNU sed")
