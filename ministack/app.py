@@ -2418,6 +2418,7 @@ async def _dispatch_service_request(
             access_denied_response,
             agentcore_endpoint_arn,
             cloudformation_service_context,
+            codebuild_resource_arns,
             dynamodb_resource_arns,
             dynamodb_service_context,
             dynamodb_transaction_checks,
@@ -2500,6 +2501,16 @@ async def _dispatch_service_request(
                     denied = enforce(access_key, iam_action, service, region, resource_arn=endpoint_arn)
             if service == "events" and not denied:
                 for extra_arn in eventbridge_resource_arns(
+                        body, region, get_account_id())[1:]:
+                    denied = enforce(
+                        access_key, iam_action, service, region,
+                        resource_arn=extra_arn,
+                    )
+                    if denied:
+                        break
+            # A call naming builds is authorized on each build's project.
+            if service == "codebuild" and not denied:
+                for extra_arn in codebuild_resource_arns(
                         body, region, get_account_id())[1:]:
                     denied = enforce(
                         access_key, iam_action, service, region,

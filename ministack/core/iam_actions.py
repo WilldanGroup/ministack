@@ -1078,6 +1078,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         name = _safe_json_field(body, "projectName") or _safe_json_field(body, "name")
         if name:
             return f"arn:aws:codebuild:{region}:{account_id}:project/{name}"
+        projects = codebuild_resource_arns(body, region, account_id)
+        if projects:
+            return projects[0]
         return "*"
 
     if service == "ecr":
@@ -1843,6 +1846,48 @@ def _cloudformation_stack_set_tags(account_id: str, region: str, stack_set_id: s
     if not isinstance(stack_set, dict) or stack_set.get("StackSetId") != stack_set_id:
         return {}
     return _resource_tag_keys(stack_set.get("Tags"))
+
+
+def codebuild_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
+    """Every project ARN a call naming builds by their ids addresses, in
+    request order.
+
+    A build's id is ``<project>:<uuid>`` and its ARN
+    ``arn:aws:codebuild:<region>:<account>:build/<project>:<uuid>``, a build
+    batch's ``build-batch/`` likewise. AWS authorizes the calls that name
+    builds (``BatchGetBuilds``, ``BatchDeleteBuilds``, ``StopBuild``,
+    ``RetryBuild`` and their build-batch kin, ``ids`` or ``id`` in the body)
+    on the project each build belongs to, so a call naming builds of several
+    projects is checked against each. Ids that are not strings, or name no
+    project, are skipped rather than crashing the enforcement path.
+    """
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    ids = data.get("ids")
+    if not isinstance(ids, list):
+        ids = [data.get("id")]
+    arns = []
+    for build_id in ids:
+        if not isinstance(build_id, str):
+            continue
+        build_region, build_account = region, account_id
+        if build_id.startswith("arn:"):
+            parts = build_id.split(":", 5)
+            if len(parts) < 6 or "/" not in parts[5]:
+                continue
+            build_region, build_account = parts[3], parts[4]
+            build_id = parts[5].split("/", 1)[1]
+        project, _, run = build_id.partition(":")
+        if not project or not run:
+            continue
+        arn = f"arn:aws:codebuild:{build_region}:{build_account}:project/{project}"
+        if arn not in arns:
+            arns.append(arn)
+    return arns
 
 
 def eventbridge_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:

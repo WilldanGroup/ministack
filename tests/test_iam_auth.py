@@ -1685,6 +1685,22 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("ssm", "POST", "/", {}, b"", {"Name": ["/app/config"]}, "us-east-1", "123") == "arn:aws:ssm:us-east-1:123:parameter/app/config"
 
+    def test_codebuild_builds_named_by_id(self):
+        from ministack.core.iam_actions import codebuild_resource_arns, extract_resource_arn
+        project = "arn:aws:codebuild:us-east-1:123:project/{}".format
+        two = json.dumps({"ids": ["runner-arm64:0f3c", "runner-x86:9a1f", "runner-arm64:77aa"]}).encode()
+        assert extract_resource_arn("codebuild", "POST", "/", {}, two, {}, "us-east-1", "123") == project("runner-arm64")
+        assert codebuild_resource_arns(two, "us-east-1", "123") == [project("runner-arm64"), project("runner-x86")]
+        one = json.dumps({"id": "runner-x86:9a1f"}).encode()
+        assert extract_resource_arn("codebuild", "POST", "/", {}, one, {}, "us-east-1", "123") == project("runner-x86")
+        by_arn = json.dumps({"ids": ["arn:aws:codebuild:eu-west-1:456:build/runner-arm64:0f3c"]}).encode()
+        assert codebuild_resource_arns(by_arn, "us-east-1", "123") == [
+            "arn:aws:codebuild:eu-west-1:456:project/runner-arm64"]
+        named = json.dumps({"projectName": "runner-arm64"}).encode()
+        assert extract_resource_arn("codebuild", "POST", "/", {}, named, {}, "us-east-1", "123") == project("runner-arm64")
+        assert extract_resource_arn("codebuild", "POST", "/", {}, b"{}", {}, "us-east-1", "123") == "*"
+        assert codebuild_resource_arns(json.dumps({"ids": [7, "", "no-colon"]}).encode(), "us-east-1", "123") == []
+
     def test_signer_profile_and_job(self):
         from ministack.core.iam_actions import extract_resource_arn
         job_body = b'{"profileName": "fleet", "source": {"s3": {}}}'
@@ -3541,6 +3557,93 @@ class TestKmsAliasAuthorization:
         assert b"AccessDeniedException" in body and b"kms:CreateAlias" in body
         assert not created
 
+
+
+class TestCodeBuildBuildsAuthorization:
+    """A call that names builds by their ids (BatchGetBuilds, StopBuild and
+    their kin) is authorized on the project each build belongs to, by ARN,
+    through the real dispatch and evaluator with AUTH on: a role granted
+    codebuild:BatchGetBuilds on one project may read its builds and is
+    refused a build of another, alone or beside its own. Before, the call
+    named no projectName and was evaluated against *, so a grant on the
+    project, the resource AWS's service authorization reference authorizes
+    these calls on, refused every one."""
+
+    _ACCOUNT = "000000000000"
+    _REGION = "us-east-1"
+    _ROLE = "codebuild-builds-probe"
+    _SESSION = "ASIACODEBUILDBUILDS1"
+
+    @staticmethod
+    def _dispatch(access_key, target, payload):
+        import ministack.app as app
+
+        headers = {
+            "host": "localhost",
+            "content-type": "application/x-amz-json-1.1",
+            "x-amz-target": f"CodeBuild_20161006.{target}",
+            "authorization": (
+                f"AWS4-HMAC-SHA256 Credential={access_key}/20260101/us-east-1/codebuild"
+                "/aws4_request, SignedHeaders=host, Signature=deadbeef"
+            ),
+        }
+        return asyncio.run(app._dispatch_service_request(
+            "POST", "/", headers, json.dumps(payload).encode(), {}, "req-1"))
+
+    @pytest.fixture
+    def session(self, monkeypatch):
+        """A role's session holding the read and the stop of one project's builds."""
+        import ministack.app as app
+        from ministack.services import iam as iam_svc
+        from ministack.services import sts as sts_svc
+
+        monkeypatch.setattr(app, "AUTH", True)
+        iam_svc._roles[self._ROLE] = {
+            "RoleName": self._ROLE,
+            "Arn": f"arn:aws:iam::{self._ACCOUNT}:role/{self._ROLE}",
+            "RoleId": "AROACODEBUILDBUILDS", "CreateDate": "2026-01-01", "Path": "/",
+            "AssumeRolePolicyDocument": "{}", "AttachedPolicies": [], "Tags": [],
+            "InlinePolicies": {"builds": json.dumps({"Statement": [{
+                "Effect": "Allow",
+                "Action": ["codebuild:BatchGetBuilds", "codebuild:StopBuild"],
+                "Resource": f"arn:aws:codebuild:{self._REGION}:{self._ACCOUNT}:project/runner-arm64",
+            }]})},
+        }
+        sts_svc.register_session(self._SESSION, {
+            "Arn": f"arn:aws:sts::{self._ACCOUNT}:assumed-role/{self._ROLE}/probe",
+            "UserId": "AROACODEBUILDBUILDS:probe",
+            "SecretAccessKey": "s", "SessionToken": "t",
+            "Expiration": time.time() + 3600,
+            "AccountId": self._ACCOUNT, "PrincipalType": "AssumedRole",
+            "SourceAccessKeyId": "test",
+            "SourcePrincipalArn": f"arn:aws:iam::{self._ACCOUNT}:root",
+        })
+        try:
+            yield self._SESSION
+        finally:
+            sts_svc._sessions.pop(self._SESSION, None)
+            iam_svc._roles.pop(self._ROLE, None)
+
+    def test_a_grant_on_the_project_reads_its_builds(self, session):
+        status, _, body = self._dispatch(
+            session, "BatchGetBuilds", {"ids": ["runner-arm64:0f3c", "runner-arm64:77aa"]})
+        assert status == 200, body
+
+    def test_the_same_grant_refuses_a_build_of_another_project(self, session):
+        status, _, body = self._dispatch(session, "BatchGetBuilds", {"ids": ["runner-x86:9a1f"]})
+        assert status == 403, body
+        assert b"AccessDeniedException" in body and b"codebuild:BatchGetBuilds" in body
+
+    def test_a_build_of_another_project_beside_its_own_is_refused(self, session):
+        status, _, body = self._dispatch(
+            session, "BatchGetBuilds", {"ids": ["runner-arm64:0f3c", "runner-x86:9a1f"]})
+        assert status == 403, body
+        assert b"codebuild:BatchGetBuilds" in body
+
+    def test_a_build_named_by_its_id_is_authorized_on_its_project(self, session):
+        status, _, body = self._dispatch(session, "StopBuild", {"id": "runner-x86:9a1f"})
+        assert status == 403, body
+        assert b"codebuild:StopBuild" in body
 
 
 class TestKmsKeyNamedByAlias:
