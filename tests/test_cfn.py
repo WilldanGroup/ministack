@@ -19615,6 +19615,36 @@ def test_cfn_sqs_queue_properties_reach_the_queue(cfn, sqs, props, expected):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+@pytest.mark.parametrize("prefix", ["cfn-sqs-fifo", "cfn-sqs-fifo-" + "n" * 70])
+def test_cfn_unnamed_fifo_queue_is_named_fifo(cfn, sqs, prefix):
+    """A queue declared FifoQueue with no QueueName stands FIFO, as AWS stands
+    it: its generated name ends .fifo within SQS's 80 characters, it takes a
+    message group, and an update keeps the same queue."""
+    stack_name = f"{prefix}-{_uuid_mod.uuid4().hex[:8]}"
+    props = {"FifoQueue": True, "ContentBasedDeduplication": True}
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_sqs_dlq_tpl(props)))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        queue_url = _stack_physical_id(cfn, stack_name, "Queue")
+        name = queue_url.rsplit("/", 1)[1]
+        assert name.endswith(".fifo") and len(name) <= 80
+        attrs = _sqs_stack_attrs(sqs, cfn, stack_name)
+        assert attrs["FifoQueue"] == "true"
+        assert attrs["ContentBasedDeduplication"] == "true"
+        sqs.send_message(QueueUrl=queue_url, MessageBody="request", MessageGroupId="class")
+        assert not _stack_physical_id(cfn, stack_name, "Dlq").endswith(".fifo")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(
+            _sqs_dlq_tpl({**props, "VisibilityTimeout": 960})))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _stack_physical_id(cfn, stack_name, "Queue") == queue_url
+        assert _sqs_stack_attrs(sqs, cfn, stack_name)["VisibilityTimeout"] == "960"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_update_sqs_queue_redrive_policy_in_place(cfn, sqs):
     """A RedrivePolicy is added, changed and removed by updates to the same queue."""
     stack_name = f"cfn-up-sqs-rp-{_uuid_mod.uuid4().hex[:8]}"

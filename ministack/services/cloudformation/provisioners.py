@@ -1469,8 +1469,22 @@ def _sqs_queue_fields(props, is_fifo):
     return fields
 
 
+def _sqs_queue_name(props, stack_name, logical_id):
+    """The queue's name: its QueueName, or one CloudFormation generates.
+
+    A queue declared ``FifoQueue: true`` with no QueueName is a FIFO queue on
+    AWS, and the name CloudFormation generates for it ends ``.fifo`` within
+    SQS's 80 characters, since SQS knows a FIFO queue by that suffix.
+    """
+    if props.get("QueueName"):
+        return props["QueueName"]
+    if str(props.get("FifoQueue", "")).lower() == "true":
+        return _physical_name(stack_name, logical_id, max_len=80 - len(".fifo")) + ".fifo"
+    return _physical_name(stack_name, logical_id, max_len=80)
+
+
 def _sqs_create(logical_id, props, stack_name):
-    name = props.get("QueueName") or _physical_name(stack_name, logical_id, max_len=80)
+    name = _sqs_queue_name(props, stack_name, logical_id)
     is_fifo = name.endswith(".fifo")
     attributes = _sqs_queue_fields(props, is_fifo)
     url = _sqs._queue_url_for_account(get_account_id(), name)
@@ -1503,9 +1517,7 @@ def _sqs_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     removed. Everything else maps onto SetQueueAttributes semantics — the
     queue record (URL, messages, dedup state) survives.
     """
-    name = new_props.get("QueueName") or _physical_name(
-        stack_name, logical_id or physical_id, max_len=80
-    )
+    name = _sqs_queue_name(new_props, stack_name, logical_id or physical_id)
     queue = _sqs._queues.get(physical_id)
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
