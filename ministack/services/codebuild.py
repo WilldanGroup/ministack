@@ -588,36 +588,122 @@ def serve_build_credentials(token):
     return 200, {"Content-Type": "application/json"}, json.dumps(session).encode()
 
 
+# A variable CodeBuild cannot resolve for a build fails it before the agent
+# runs anything. The phase context's status code is CodeBuild's own, its
+# message the service's code and words ("Phase context status code: Decrypted
+# Variables Error Message: AccessDeniedException: User: ... is not authorized
+# to perform: ssm:GetParameters on resource: ..."). Which phase carries it no
+# AWS page names: unmeasured, it is PROVISIONING here, the phase before the
+# agent's own, which is where the emulator fails it.
+VARIABLES_ERROR = "Decrypted Variables Error"
+VARIABLES_PHASE = "PROVISIONING"
+
+
+class VariableRefused(Exception):
+    """A build variable the service refused to resolve: its code and words."""
+
+    def __init__(self, code, words):
+        super().__init__(f"{code}: {words}")
+        self.code = code
+        self.words = words
+
+
+def _parameter_store_value(name, project, build, session):
+    """A PARAMETER_STORE variable's value: the parameter its value names, read
+    and decrypted as the project's service role, as CodeBuild reads it with
+    ssm:GetParameters (CodeBuild API Reference, EnvironmentVariable)."""
+    from ministack import app
+    from ministack.services import ssm as ssm_svc
+
+    region = get_region()
+    resource = name if name.startswith("arn:") else (
+        f"arn:aws:ssm:{region}:{get_account_id()}:parameter/{name.lstrip('/')}")
+    if app.AUTH:
+        from ministack.core.iam_evaluator import AuthError, enforce
+
+        key = (session or _build_session(project, build))["AccessKeyId"]
+        denied = enforce(key, "ssm:GetParameters", "ssm", region, resource)
+        if isinstance(denied, AuthError):
+            raise VariableRefused(denied.code, denied.message)
+        if denied is not None:
+            reason = (
+                "with an explicit deny in an identity-based policy" if denied.decision == "Deny"
+                else "because no identity-based policy allows the ssm:GetParameters action"
+            )
+            raise VariableRefused(
+                "AccessDeniedException",
+                f"User: {denied.principal_arn} is not authorized to perform: "
+                f"ssm:GetParameters on resource: {resource} {reason}")
+    value = ssm_svc.resolve_parameter_value(name, decrypt=True)
+    if value is None:
+        raise VariableRefused("ParameterNotFound", f"Parameter {name} not found")
+    return value
+
+
 def _write_env_file(path, project, build, owner=None):
+    """The build's environment, each variable as the build reads it: a
+    PARAMETER_STORE variable as its parameter's value, never its name. A
+    variable the service refuses raises VariableRefused before anything is
+    written."""
     env = project.get("environment", {}) or {}
-    declared = {var.get("name") for var in env.get("environmentVariables") or []}
+    variables = env.get("environmentVariables") or []
+    declared = {var.get("name") for var in variables}
+
+    # The build runs as its project's service role. CodeBuild serves the
+    # role's session at AWS_CONTAINER_CREDENTIALS_FULL_URI, and so does this
+    # endpoint. The AWS SDKs read a plain-http full URI only from a loopback or
+    # link-local host, which the bridge gateway is not, so the same session is
+    # also in the SDK's own variables, the way Lambda hands a function its
+    # role's session.
+    endpoint = _aws_endpoint()
+    token = session = None
+    if endpoint and "AWS_ENDPOINT_URL" not in declared:
+        token, session = _serve_build_session(project, build)
+
+    values = []
+    for var in variables:
+        value = var.get("value", "")
+        if var.get("type") == "PARAMETER_STORE":
+            value = _parameter_store_value(value, project, build, session)
+        values.append((var.get("name", ""), value))
+
     with open(path, "w", encoding="utf-8") as fh:
         if owner is not None:
             _give_to_owner(owner, path)
-        for var in env.get("environmentVariables") or []:
-            fh.write(f"{var.get('name', '')}={var.get('value', '')}\n")
+        for name, value in values:
+            fh.write(f"{name}={value}\n")
         fh.write(f"CODEBUILD_BUILD_ID={build['id']}\n")
         fh.write(f"CODEBUILD_BUILD_ARN={build['arn']}\n")
         fh.write(f"CODEBUILD_BUILD_NUMBER={build['buildNumber']}\n")
         fh.write(f"CODEBUILD_INITIATOR={build['initiator']}\n")
         fh.write(f"AWS_DEFAULT_REGION={get_region()}\n")
 
-        endpoint = _aws_endpoint()
-        if endpoint and "AWS_ENDPOINT_URL" not in declared:
+        if session is not None:
             fh.write(f"AWS_ENDPOINT_URL={endpoint}\n")
-            # The build runs as its project's service role. CodeBuild serves
-            # the role's session at AWS_CONTAINER_CREDENTIALS_FULL_URI, and so
-            # does this endpoint. The AWS SDKs read a plain-http full URI only
-            # from a loopback or link-local host, which the bridge gateway is
-            # not, so the same session is also in the SDK's own variables, the
-            # way Lambda hands a function its role's session.
-            token, session = _serve_build_session(project, build)
             fh.write(f"AWS_CONTAINER_CREDENTIALS_FULL_URI={endpoint}{CREDENTIALS_PATH}{token}\n")
             for name, value in (("AWS_ACCESS_KEY_ID", session["AccessKeyId"]),
                                 ("AWS_SECRET_ACCESS_KEY", session["SecretAccessKey"]),
                                 ("AWS_SESSION_TOKEN", session["Token"])):
                 if name not in declared:
                     fh.write(f"{name}={value}\n")
+
+
+def _fail_on_variable(build, refused):
+    """End a build whose variable the service refused, before the agent runs:
+    the phase failed with the refusal as its context, in the build's log as
+    the agent writes a phase's context, and the build FAILED."""
+    _record_phase(build, "QUEUED", "SUCCEEDED")
+    _record_phase(build, VARIABLES_PHASE, "FAILED")
+    phase = next(p for p in reversed(build["phases"]) if p["phaseType"] == VARIABLES_PHASE)
+    phase["contexts"] = [{"statusCode": VARIABLES_ERROR, "message": str(refused)}]
+    logger.error("Build %s: %s: %s", build["id"], VARIABLES_ERROR, refused)
+    try:
+        emit = _log_sink(build)
+        emit(f"Phase complete: {VARIABLES_PHASE} State: FAILED")
+        emit(f"Phase context status code: {VARIABLES_ERROR} Message: {refused}")
+    except Exception:
+        logger.exception("Could not write the log of %s", build["id"])
+    _finish_build(build, "FAILED")
 
 
 def _record_phase(build, phase_type, status):
@@ -805,7 +891,13 @@ def _execute_build(build_id, project):
         with open(buildspec_path, "w", encoding="utf-8") as fh:
             _give_to_owner(owner, buildspec_path)
             fh.write(buildspec)
-        _write_env_file(os.path.join(env_dir, "env.list"), project, build, owner)
+        try:
+            _write_env_file(os.path.join(env_dir, "env.list"), project, build, owner)
+        except VariableRefused as refused:
+            _withdraw_build_session(build_id)
+            _fail_on_variable(build, refused)
+            _remove_workdir(build_id, workdir)
+            return
         compose_wrapper = os.path.join(workdir, "docker-compose")
         with open(compose_wrapper, "w", encoding="utf-8") as fh:
             _give_to_owner(owner, compose_wrapper)

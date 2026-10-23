@@ -1326,3 +1326,117 @@ def test_execute_build_agent_exit_zero_without_phases_is_fault(monkeypatch, tmp_
 
     assert build["buildStatus"] == "FAULT"
     assert container.removed is True
+
+
+# ========== PARAMETER_STORE variables ==========
+#
+# CodeBuild hands a build the value of a PARAMETER_STORE variable, whose own
+# value names a Parameter Store parameter, read and decrypted as the
+# project's service role (CodeBuild API Reference, EnvironmentVariable), on
+# the project or in StartBuild's override alike. A parameter the role may not
+# read, or one that does not stand, fails the build before its buildspec
+# runs, with the service's refusal in the phase's context.
+
+_PARAMETER_ACCOUNT = "000000000000"
+_PARAMETER_REGION = "us-east-1"
+_READABLE = "/runners/willdangroup/swb-local-arm64-01"
+
+
+@pytest.fixture
+def parameter_store(monkeypatch, tmp_path):
+    from ministack import app
+    from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, request_scope
+    from ministack.services import iam, ssm, sts
+
+    monkeypatch.setattr(app, "AUTH", True)
+    monkeypatch.setattr(iam, "_roles", AccountScopedDict())
+    monkeypatch.setattr(sts, "_sessions", {})
+    for name in ("_parameters", "_parameter_history", "_tags"):
+        monkeypatch.setattr(ssm, name, AccountRegionScopedDict())
+    docker = _FakeDocker(_FakeContainer(["Phase complete: BUILD State: SUCCEEDED"]))
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: docker)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    with request_scope(_PARAMETER_ACCOUNT, _PARAMETER_REGION):
+        # The project's role may read its registrations' path, and nothing else.
+        iam._roles["codebuild-role"] = {
+            "RoleName": "codebuild-role",
+            "Arn": f"arn:aws:iam::{_PARAMETER_ACCOUNT}:role/codebuild-role",
+            "InlinePolicies": {"registrations": json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "ssm:GetParameters",
+                    "Resource": f"arn:aws:ssm:{_PARAMETER_REGION}:{_PARAMETER_ACCOUNT}:parameter/runners/*",
+                }],
+            })},
+            "AttachedPolicies": [],
+        }
+        for name, value in ((_READABLE, "the-registration"), ("/elsewhere/secret", "not-the-runners")):
+            status, _headers, body = ssm._put_parameter(
+                {"Name": name, "Type": "SecureString", "Value": value})
+            assert status == 200, body
+        yield docker
+
+
+def _parameter_project(name):
+    project = _execution_project()
+    project["environment"]["environmentVariables"].append(
+        {"name": "RUNNER_JIT_CONFIG", "value": name, "type": "PARAMETER_STORE"})
+    return project
+
+
+def _handed_env(docker):
+    with open(os.path.join(docker.containers.handed, "env", "env.list"), encoding="utf-8") as fh:
+        return fh.read().splitlines()
+
+
+@pytest.mark.parametrize("passed", ["declared", "override"])
+def test_a_parameter_store_variable_reaches_the_build_as_its_value(parameter_store, passed):
+    docker = parameter_store
+    if passed == "declared":
+        project = _parameter_project(_READABLE)
+    else:
+        project = codebuild._with_environment_overrides(_execution_project(), [
+            {"name": "RUNNER_JIT_CONFIG", "value": _READABLE, "type": "PARAMETER_STORE"}])
+    build = _seed_execution_build(project, "demo:0021")
+
+    codebuild._execute_build("demo:0021", project)
+
+    assert build["buildStatus"] == "SUCCEEDED"
+    env = _handed_env(docker)
+    assert "RUNNER_JIT_CONFIG=the-registration" in env
+    assert f"RUNNER_JIT_CONFIG={_READABLE}" not in env
+    assert "FOO=bar" in env
+
+
+@pytest.mark.parametrize("name, code, words", [
+    ("/elsewhere/secret", "AccessDeniedException",
+     "is not authorized to perform: ssm:GetParameters on resource: "
+     f"arn:aws:ssm:{_PARAMETER_REGION}:{_PARAMETER_ACCOUNT}:parameter/elsewhere/secret"),
+    ("/runners/willdangroup/gone", "ParameterNotFound",
+     "Parameter /runners/willdangroup/gone not found"),
+], ids=["the role may not read it", "it does not stand"])
+def test_a_parameter_store_variable_it_cannot_read_fails_the_build_before_its_buildspec(
+        parameter_store, tmp_path, name, code, words):
+    docker = parameter_store
+    project = _parameter_project(name)
+    build = _seed_execution_build(project, "demo:0022")
+
+    codebuild._execute_build("demo:0022", project)
+
+    assert build["buildStatus"] == "FAILED"
+    assert docker.containers.image is None
+    failed = [p for p in build["phases"] if p.get("phaseStatus") == "FAILED"]
+    assert [p["phaseType"] for p in failed] == ["PROVISIONING", "COMPLETED"]
+    [context] = failed[0]["contexts"]
+    assert context["statusCode"] == "Decrypted Variables Error"
+    assert context["message"].startswith(f"{code}: ")
+    assert words in context["message"]
+    if code == "AccessDeniedException":
+        assert "assumed-role/codebuild-role/" in context["message"]
+
+    from ministack.services import cloudwatch_logs as cwl
+    stream = cwl._log_groups[build["logs"]["groupName"]]["streams"][build["logs"]["streamName"]]
+    assert (f"Phase context status code: Decrypted Variables Error Message: {context['message']}"
+            in [event["message"] for event in stream["events"]])
+    assert not (tmp_path / "demo_0022").exists()
