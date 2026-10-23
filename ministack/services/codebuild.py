@@ -304,11 +304,21 @@ CODEBUILD_DOCKER_FLAGS = os.environ.get("CODEBUILD_DOCKER_FLAGS", "")
 # build cannot reach a server on the host. This wrapper, mounted ahead of the
 # agent's docker-compose on its PATH, gives the build service the same mapping
 # in the final file, then runs the agent's own docker-compose.
+#
+# The same file binds the ARTIFACTS folder on the host into the build service
+# at /codebuild/output/artifacts, which the build, root as CodeBuild runs it,
+# would write as root. The wrapper gives the build a volume of its compose
+# project there in its place, which the build's end removes with the project
+# (_remove_compose_project): nothing here reads a build's artifacts back.
 _COMPOSE_WRAPPER_PATH = "/usr/local/sbin/docker-compose"
 _COMPOSE_WRAPPER = """#!/bin/sh
 f=/LocalBuild/agent-resources/customer-specific.yml
 if [ -f "$f" ] && ! grep -q 'host.docker.internal:host-gateway' "$f"; then
   sed -i 's/^  build:$/  build:\\n    extra_hosts:\\n      - "host.docker.internal:host-gateway"/' "$f"
+fi
+if [ -f "$f" ] && ! grep -q 'artifacts_volume:/codebuild/output/artifacts$' "$f"; then
+  sed -i -e 's#^\\( *- \\).*:/codebuild/output/artifacts$#\\1artifacts_volume:/codebuild/output/artifacts#' \\
+    -e 's/^volumes:$/volumes:\\n  artifacts_volume:\\n    driver: local/' "$f"
 fi
 exec /usr/local/bin/docker-compose "$@"
 """

@@ -922,6 +922,126 @@ def test_the_build_service_reaches_the_host_by_name(monkeypatch, tmp_path):
         '  build:\n    extra_hosts:\n      - "host.docker.internal:host-gateway"\n')
 
 
+
+# The compose file the agent hands its docker-compose when it copies the
+# build's source (no mount mode): AWS's docker-compose.yml from
+# /LocalBuild/agent-resources, as the agent's edit-docker-compose leaves it in
+# customer-specific.yml with an environment file of FOO=bar and a build id.
+# Read from the pinned arm64 agent (AGENT_IMAGES) on 2026-10-23; the x86_64
+# agent ships the same docker-compose.yml.
+_AGENT_DEFAULT_COMPOSE = """version: "2"
+services:
+  agent:
+    image: ${LOCAL_AGENT_IMAGE}
+    ports:
+    - "3000"
+    volumes:
+    - source_volume:/codebuild/input
+    - user_volume:/codebuild/output
+    - ${CODEBUILD_LOCAL_SOURCE_DIRECTORY}:/codebuild/local/src:ro
+    environment:
+    - CODEBUILD_LOCAL_BUILD=true
+    - AWS_ACCESS_KEY_ID=key
+    - AWS_SECRET_ACCESS_KEY=secret
+    - CODEBUILD_LOCAL_ECS_AGENT_ACCESS_KEY=
+    - CODEBUILD_LOCAL_ECS_AGENT_SECRET_KEY=
+    - CODEBUILD_LOCAL_ECS_AGENT_SESSION_TOKEN=
+    - CODEBUILD_CONTAINER_TOKENS=12345
+    - AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/credentials
+    - CODEBUILD_REGION=us-west-2
+    - CODEBUILD_CTS_ENDPOINT=http://localhost:8100
+    - CODEBUILD_LOCAL_ECS_AGENT=true
+    - CODEBUILD_GOLANG_AGENT=true
+    - CODEBUILD_LOCAL_BUILD_DATA_FILE=/LocalBuild/agent-resources/local-build-config.yml
+    - CODEBUILD_MOUNT_SRC_DIR=${CODEBUILD_MOUNT_SRC_DIR}
+    - BUILDSPEC_PATH=${CODEBUILD_LOCAL_BUILDSPEC_PATH}
+    - SOURCE_PATH=${CODEBUILD_LOCAL_SOURCE_DIRECTORY}
+    - IS_INNER_CONTAINER=true
+    - CUSTOMER_FOO=bar
+    - CUSTOMER_CODEBUILD_BUILD_ID=demo:0001
+  build:
+    image: ${IMAGE_FOR_CODEBUILD_LOCAL_BUILD}
+    privileged: ${BUILD_CONTAINER_PRIVILEGED_MODE}
+    user: root
+    entrypoint: sh -c "while [ ! -f /codebuild/readonly/bin/executor.done ]; do sleep
+      1; done && /codebuild/readonly/bin/executor > /dev/null"
+    volumes:
+    - source_volume:/codebuild/readonly
+    - user_volume:/codebuild/output
+    - /var/run/docker.sock:/var/run/docker.sock
+    - ${CODEBUILD_LOCAL_ARTIFACTS_DIRECTORY}:/codebuild/output/artifacts
+    environment:
+    - NO_PROXY=BMR:3000
+    - CODEBUILD_LOCAL_BUILD=true
+    - CODEBUILD_AGENT_PORT=http://BMR:3000
+    - CODEBUILD_AUTH_TOKEN=12345
+    - CODEBUILD_BUILD_ID=local:00000000-0000-0000-0000-000000000000
+    - CODEBUILD_BUILD_IMAGE=${IMAGE_FOR_CODEBUILD_LOCAL_BUILD}
+    - CODEBUILD_INITIATOR=${CODEBUILD_LOCAL_INITIATOR}
+    links:
+    - agent:BMR
+volumes:
+  source_volume:
+    driver: local
+  user_volume:
+    driver: local
+"""
+
+
+def _wrapped(tmp_path, wrapper, compose_text):
+    """`compose_text` as the wrapper leaves it, the wrapper run twice as the
+    agent runs docker-compose more than once, with the agent's own
+    docker-compose in its place echoing what it was asked."""
+    import subprocess
+
+    compose = tmp_path / "customer-specific.yml"
+    compose.write_text(compose_text, encoding="utf-8")
+    script = tmp_path / "wrapper.sh"
+    script.write_text(
+        open(wrapper, encoding="utf-8").read()
+        .replace("/LocalBuild/agent-resources/customer-specific.yml", str(compose))
+        .replace("exec /usr/local/bin/docker-compose", "exec echo ran"),
+        encoding="utf-8")
+    for _ in range(2):
+        ran = subprocess.run(["sh", str(script), "config", "--quiet"], capture_output=True, text=True)
+        assert ran.stdout.strip() == "ran config --quiet", ran.stderr
+    return compose.read_text(encoding="utf-8")
+
+
+def test_a_builds_artifacts_stay_in_a_volume_of_its_own(monkeypatch, tmp_path):
+    """The wrapper gives the build service a volume of the build's compose
+    project for its artifacts in place of the agent's bind of the ARTIFACTS
+    folder, so the build, root as CodeBuild runs it, writes nothing on the host
+    and the build's end removes the volume with the project. Nothing the build
+    mounts is a host path but the Docker socket, and the agent's only one is
+    the source it copies, read-only."""
+    import yaml
+
+    container = _FakeContainer(["Phase complete: BUILD State: SUCCEEDED"])
+    docker = _FakeDocker(container)
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: docker)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path / "workspace"))
+    _seed_execution_build(_execution_project(), "demo:0017")
+    codebuild._execute_build("demo:0017", _execution_project())
+    if not _gnu_sed():
+        pytest.skip("the wrapper runs in the agent's image, whose sed is GNU sed")
+    mounted = {bind["bind"]: source for source, bind in docker.containers.kwargs["volumes"].items()}
+    wrapper = os.path.join(docker.containers.handed, os.path.basename(mounted["/usr/local/sbin/docker-compose"]))
+
+    final = yaml.safe_load(_wrapped(tmp_path, wrapper, _AGENT_DEFAULT_COMPOSE))
+
+    declared = set(final["volumes"])
+    build_mounts = dict(reversed(v.rsplit(":", 1)) for v in final["services"]["build"]["volumes"])
+    assert build_mounts["/codebuild/output/artifacts"] in declared
+    assert all(source in declared or source == "/var/run/docker.sock"
+               for source in build_mounts.values()), build_mounts
+    agent_mounts = final["services"]["agent"]["volumes"]
+    assert [v for v in agent_mounts if v.split(":", 1)[0] not in declared] == [
+        "${CODEBUILD_LOCAL_SOURCE_DIRECTORY}:/codebuild/local/src:ro"]
+    # The host-gateway mapping the same wrapper adds stands beside it.
+    assert final["services"]["build"]["extra_hosts"] == ["host.docker.internal:host-gateway"]
+
+
 class _ComposeDaemon:
     """The daemon an agent's docker-compose leaves resources on, each labelled
     with its compose project the way compose labels them."""
@@ -954,7 +1074,8 @@ class _ComposeDaemon:
     def compose_up(self, project):
         for kind, name in (("container", f"{project}-agent-1"), ("container", f"{project}-build-1"),
                            ("network", f"{project}_default"), ("volume", f"{project}_source_volume"),
-                           ("volume", f"{project}_user_volume")):
+                           ("volume", f"{project}_user_volume"),
+                           ("volume", f"{project}_artifacts_volume")):
             self.resources.append(self._Resource(self, kind, name, project))
 
     def _run_agent(self, image, **kwargs):
@@ -990,7 +1111,7 @@ def test_a_build_removes_its_compose_project_when_it_ends(monkeypatch, tmp_path)
     assert agent.removed
     assert docker.names() == sorted([
         f"{other}-agent-1", f"{other}-build-1", f"{other}_default",
-        f"{other}_source_volume", f"{other}_user_volume",
+        f"{other}_source_volume", f"{other}_user_volume", f"{other}_artifacts_volume",
     ])
 
 
