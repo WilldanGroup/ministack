@@ -12,6 +12,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import time
 from urllib.parse import parse_qs
 
@@ -101,6 +102,60 @@ def reset():
     _sessions.clear()
 
 
+# What AssumeRole takes as session policies (STS API Reference, AssumeRole,
+# Request Parameters): an inline Policy of at most 2,048 characters and at most
+# ten PolicyArns.
+_SESSION_POLICY_MAX_LENGTH = 2048
+_SESSION_POLICY_ARNS_MAX = 10
+_POLICY_ARN_MEMBER = re.compile(r"PolicyArns\.member\.(\d+)\.arn")
+
+
+def _session_policies(params):
+    """The session policies a request passes, as the session records them, or
+    the response refusing them: ({} for none, None) or (None, error).
+
+    A session issued under session policies may do only what both its role's
+    policies and its session policies allow (IAM User Guide, Session policies),
+    which the evaluator applies to every call the session makes.
+    """
+    policy = _p(params, "Policy") or ""
+    arns = []
+    raw = params.get("PolicyArns")
+    if isinstance(raw, list):
+        # JSON protocol: [{"arn": ...}, ...]
+        arns = [str(item.get("arn", "")) for item in raw if isinstance(item, dict)]
+    members = sorted(
+        (int(m.group(1)), _p(params, key))
+        for key in params
+        if (m := _POLICY_ARN_MEMBER.fullmatch(key))
+    )
+    arns += [arn for _, arn in members]
+    if len(policy) > _SESSION_POLICY_MAX_LENGTH:
+        return None, _error(
+            400, "ValidationError",
+            "1 validation error detected: Value at 'policy' failed to satisfy "
+            f"constraint: Member must have length less than or equal to {_SESSION_POLICY_MAX_LENGTH}",
+            ns="sts")
+    if len(arns) > _SESSION_POLICY_ARNS_MAX:
+        return None, _error(
+            400, "ValidationError",
+            "1 validation error detected: Value at 'policyArns' failed to satisfy "
+            f"constraint: Member must have length less than or equal to {_SESSION_POLICY_ARNS_MAX}",
+            ns="sts")
+    if policy:
+        try:
+            json.loads(policy)
+        except (json.JSONDecodeError, TypeError):
+            return None, _error(400, "MalformedPolicyDocument",
+                                "The policy is not in the valid JSON format.", ns="sts")
+    recorded = {}
+    if policy:
+        recorded["SessionPolicy"] = policy
+    if arns:
+        recorded["SessionPolicyArns"] = arns
+    return recorded, None
+
+
 def _assumed_role_arn(role_arn: str, session_name: str):
     try:
         spec = parse_arn(role_arn)
@@ -179,6 +234,9 @@ async def handle_request(method, path, headers, body, query_params):
         assumed_arn, validation_error = _assumed_role_arn(role_arn, session_name)
         if validation_error:
             return validation_error
+        session_policies, policy_error = _session_policies(params)
+        if policy_error:
+            return policy_error
         caller = _caller_identity(headers, query_params)
         if isinstance(caller, CredentialResolutionError):
             return _credential_error_response(caller)
@@ -237,6 +295,7 @@ async def handle_request(method, path, headers, body, query_params):
             "PrincipalType": "AssumedRole",
             "SourceAccessKeyId": caller["accessKey"],
             "SourcePrincipalArn": caller["userArn"],
+            **session_policies,
         })
         if use_json:
             return json_response({
@@ -266,6 +325,9 @@ async def handle_request(method, path, headers, body, query_params):
         assumed_arn, validation_error = _assumed_role_arn(role_arn, session)
         if validation_error:
             return validation_error
+        session_policies, policy_error = _session_policies(params)
+        if policy_error:
+            return policy_error
         duration = int(_p(params, "DurationSeconds") or 3600)
         access_key = _gen_session_access_key()
         secret_key = _gen_secret()
@@ -279,6 +341,7 @@ async def handle_request(method, path, headers, body, query_params):
             "Expiration": time.time() + duration,
             "AccountId": role_arn.split(":")[4],
             "PrincipalType": "AssumedRole",
+            **session_policies,
         })
         provider = _p(params, "ProviderId") or "sts.amazonaws.com"
         if use_json:

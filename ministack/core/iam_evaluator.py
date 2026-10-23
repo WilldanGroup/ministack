@@ -3,12 +3,16 @@
 """IAM policy evaluation engine.
 
 Implements the AWS IAM policy evaluation algorithm (single-account,
-no SCPs/permissions boundaries/session policies) behind the AUTH=true flag.
+no SCPs/permissions boundaries) behind the AUTH=true flag.
 
 Evaluation order:
   1. Explicit Deny in any applicable policy → DENY
   2. Explicit Allow in any applicable policy → ALLOW
   3. No matching Allow → implicit DENY
+
+A session issued under session policies is held to them as well: a call it
+makes is allowed only where its role's policies and its session policies
+both allow it.
 """
 
 import contextvars
@@ -70,6 +74,9 @@ class PrincipalInfo:
     type: str  # "User", "AssumedRole", "Root"
     account: str
     policies: list[list[ParsedStatement]] | None  # None = root (allow-all)
+    # The session policies an assumed-role session was issued under; None
+    # where it was issued under none, which limits nothing.
+    session_policies: list[list[ParsedStatement]] | None = None
 
 
 @dataclass
@@ -745,6 +752,28 @@ def _gather_role_policies(role_name: str, account_id: str) -> list[list[ParsedSt
     return policies
 
 
+def _gather_session_policies(access_key_id: str,
+                             account_id: str) -> list[list[ParsedStatement]] | None:
+    """The session policies a temporary credential was issued under — the
+    inline Policy and each PolicyArns managed policy its AssumeRole passed —
+    or None where it passed none. A document that resolves to nothing grants
+    nothing, so the session it limits may do nothing it covers."""
+    from ministack.services import sts as sts_svc
+
+    session = sts_svc._sessions.get(access_key_id) or {}
+    inline = session.get("SessionPolicy")
+    arns = session.get("SessionPolicyArns") or []
+    if not inline and not arns:
+        return None
+    policies = []
+    if inline:
+        policies.append(parse_policy_document(inline))
+    for policy_arn in arns:
+        doc = _resolve_managed_policy_document(policy_arn, account_id)
+        policies.append(parse_policy_document(doc) if doc else [])
+    return policies
+
+
 def _gather_user_policies(user_name: str, account_id: str) -> list[list[ParsedStatement]]:
     from ministack.services import iam as iam_svc
     user = iam_svc._users.get_scoped(account_id, None, user_name)
@@ -1071,6 +1100,10 @@ def resolve_principal(access_key_id: str,
         type=credential.principal_type,
         account=credential.account_id,
         policies=policies,
+        session_policies=(
+            _gather_session_policies(access_key_id, account_id)
+            if credential.principal_type == "AssumedRole" else None
+        ),
     )
 
 
@@ -1177,6 +1210,14 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     )
 
     result = evaluate(ctx, principal.policies)
+    if result.decision == "Allow" and principal.session_policies is not None:
+        # The session's permissions are the intersection of its role's and
+        # its session policies' (IAM User Guide, Session policies): what the
+        # role allows, the session policies must allow too, and an explicit
+        # deny in them denies.
+        result = evaluate(ctx, principal.session_policies)
+        if result.decision == "ImplicitDeny":
+            result.reason = "No session policy allows the action"
 
     if result.decision == "Allow":
         return None
