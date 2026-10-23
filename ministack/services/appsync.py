@@ -1607,6 +1607,48 @@ def _auth_modes(api):
     return modes
 
 
+def _lambda_authorizer_config(api):
+    """The API's Lambda authorizer: the default mode's, or the one an
+    additional AWS_LAMBDA provider declares, which AppSync admits once."""
+    if api.get("lambdaAuthorizerConfig"):
+        return api["lambdaAuthorizerConfig"]
+    for extra in api.get("additionalAuthenticationProviders") or []:
+        if (isinstance(extra, dict) and extra.get("authenticationType") == "AWS_LAMBDA"
+                and extra.get("lambdaAuthorizerConfig")):
+            return extra["lambdaAuthorizerConfig"]
+    return None
+
+
+def _lambda_authorizer_for(api, request_headers, identified=False):
+    """The Lambda authorizer configuration that takes this request, or None.
+
+    Where the authorizer names an identityValidationExpression, it takes the
+    tokens that match it and no other: AppSync denies a token that does not
+    match before it calls the function, and a token that does is handed to the
+    function whichever mode the API defaults to (AppSync Developer Guide,
+    AWS_LAMBDA authorization). Without an expression, the default mode's
+    authorizer takes every request, as before, and an additional provider's
+    takes a token no other mode identified.
+    """
+    config = _lambda_authorizer_config(api)
+    if config is None:
+        return None
+    headers = {str(k).lower(): v for k, v in (request_headers or {}).items()}
+    token = str(headers.get("authorization") or "")
+    expression = config.get("identityValidationExpression")
+    if expression:
+        try:
+            return config if re.fullmatch(expression, token) else None
+        except re.error:
+            logger.warning("AppSync: identityValidationExpression %r does not compile", expression)
+            return None
+    if api.get("lambdaAuthorizerConfig"):
+        return config
+    if not token or token.startswith("AWS4-HMAC-SHA256") or identified:
+        return None
+    return config
+
+
 def _request_is_authenticated(api_id, api, request_headers):
     """Whether the request satisfies any of the API's configured providers.
 
@@ -1635,7 +1677,7 @@ def _request_is_authenticated(api_id, api, request_headers):
             return True
     if "AWS_IAM" in modes and auth.startswith("AWS4-HMAC-SHA256"):
         return True
-    if "AWS_LAMBDA" in modes and api.get("lambdaAuthorizerConfig"):
+    if "AWS_LAMBDA" in modes and _lambda_authorizer_for(api, headers) is not None:
         # The authorizer runs below and may still reject.
         return True
     return False
@@ -1651,10 +1693,11 @@ def _execute_with_schema(api_id, sdl, query, variables, operation_name, request_
         identity = _cognito_identity(api, request_headers)
     if identity is None:
         identity = _oidc_identity(api, request_headers)
-    if api.get("lambdaAuthorizerConfig"):
+    authorizer = _lambda_authorizer_for(api, request_headers, identified=identity is not None)
+    if authorizer is not None:
         try:
             identity = _invoke_lambda_authorizer(
-                api_id, api["lambdaAuthorizerConfig"], request_headers,
+                api_id, authorizer, request_headers,
                 query=query, variables=variables, operation_name=operation_name)
         except _AuthorizerRejected:
             return _unauthorized_response()
@@ -1756,10 +1799,12 @@ def _execute_graphql(api_id, data, request_headers=None):
         identity = _cognito_identity(api, request_headers or {})
     if identity is None:
         identity = _oidc_identity(api, request_headers or {})
-    if api.get("lambdaAuthorizerConfig"):
+    authorizer = _lambda_authorizer_for(
+        api, request_headers or {}, identified=identity is not None)
+    if authorizer is not None:
         try:
             identity = _invoke_lambda_authorizer(
-                api_id, api["lambdaAuthorizerConfig"], request_headers or {},
+                api_id, authorizer, request_headers or {},
                 query=query,
                 variables=variables,
                 operation_name=operation_name,
