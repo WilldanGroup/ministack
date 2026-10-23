@@ -7789,6 +7789,47 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
     assert "unknown_flag" not in captured
 
 
+@pytest.mark.parametrize("memory_size, flags, mem_limit, memswap_limit", [
+    (256, "", "256m", "256m"),
+    (None, "", "128m", "128m"),
+    (256, "-m 1g", "1g", None),
+])
+def test_lambda_container_limited_to_declared_memory(monkeypatch, memory_size, flags,
+                                                     mem_limit, memswap_limit):
+    """A function's container is limited to the memory it declares, swap
+    included, 128 MB where it declares none, as AWS gives a function only what
+    it declares; an explicit -m in LAMBDA_DOCKER_FLAGS still wins, with
+    Docker's own swap default."""
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", flags)
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    captured = {}
+    fake_container = _mk_container()
+    fake_container.ports = {"8080/tcp": [{"HostPort": "9999"}]}
+
+    def _fake_create(**kwargs):
+        captured.update(kwargs)
+        return fake_container
+
+    fake_client = MagicMock()
+    fake_client.containers.create = _fake_create
+    fake_client.images.get = MagicMock()
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(e,c): pass")
+    config = {"FunctionName": "mem-fn", "Runtime": "python3.12", "Handler": "index.handler",
+              "PackageType": "Zip", "Timeout": 3,
+              "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:mem-fn"}
+    if memory_size is not None:
+        config["MemorySize"] = memory_size
+
+    lsvc._spawn_lambda_container(config, buf.getvalue())
+
+    assert captured["mem_limit"] == mem_limit
+    assert captured.get("memswap_limit") == memswap_limit
+
+
 def test_lambda_filesystem_configs_s3_mount_round_trip(lam):
     """FileSystemConfigs accept-and-echo: AWS added S3-bucket ARN support
     in 2026-04 alongside the original EFS access-point ARNs. The emulator

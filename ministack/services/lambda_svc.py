@@ -4599,6 +4599,18 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             config.get("FunctionName"), docker_platform, reason)
         return _spawn_lambda_container(config, code_zip, _pin_platform=False)
 
+    # AWS gives a function the memory it declares and no more ("Memory is the
+    # amount of memory available to your Lambda function at runtime", Lambda
+    # Developer Guide, Configure Lambda function memory). Without a limit a
+    # function that runs away fills the host; with one, it fails its own
+    # invocation as it would in AWS. Swap is held to the same amount, since on
+    # a host with swap Docker otherwise allows as much again. Set before the
+    # flags merge so an explicit -m in LAMBDA_DOCKER_FLAGS still wins, and with
+    # it Docker's own swap default.
+    declared_memory = f"{int(config.get('MemorySize') or 128)}m"
+    run_kwargs["mem_limit"] = declared_memory
+    run_kwargs["memswap_limit"] = declared_memory
+
     # Apply LAMBDA_DOCKER_FLAGS — merge parsed kwargs into run_kwargs
     if LAMBDA_DOCKER_FLAGS:
         df_kwargs = _parse_docker_flags(LAMBDA_DOCKER_FLAGS)
@@ -4608,6 +4620,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         df_mounts = df_kwargs.pop("mounts", [])
         if df_mounts:
             run_kwargs.setdefault("mounts", []).extend(df_mounts)
+        if "mem_limit" in df_kwargs:
+            run_kwargs.pop("memswap_limit", None)
         run_kwargs.update(df_kwargs)
 
     # `host.docker.internal` only resolves out of the box on Docker Desktop
