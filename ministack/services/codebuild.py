@@ -279,7 +279,32 @@ def _architecture_refusal(project, environment_type_override=None):
 # container, one folder per build, which the build's end removes. Not an AWS
 # concept: its one setting is where it is, which must be the same path on the
 # host (above), and which is this MiniStack's own where several share a daemon.
+# Everything this MiniStack makes in it is its owner's (_give_to_owner).
 WORKSPACE = os.environ.get("MINISTACK_CODEBUILD_WORKSPACE") or "/tmp/ministack-codebuild"
+
+
+def _workspace_owner():
+    """The (uid, gid) that owns WORKSPACE: the host user who made the folder
+    bound in, or this MiniStack's own where it makes WORKSPACE itself."""
+    os.makedirs(WORKSPACE, exist_ok=True)
+    stat = os.stat(WORKSPACE)
+    return stat.st_uid, stat.st_gid
+
+
+def _give_to_owner(owner, path):
+    """Give `path`, just made in WORKSPACE and still empty, to WORKSPACE's owner.
+
+    This MiniStack runs as root in its image, and WORKSPACE is a folder of the
+    host user's bound in: a folder it made there as root would keep whatever is
+    written into it from that user once a run stopped before the build's end
+    removed it. Given away while empty, nothing here is ever root's, whenever
+    the run stops. Best effort where this MiniStack may not give a file away,
+    run as a user other than root: what it makes is then its own user's."""
+    try:
+        os.chown(path, *owner)
+    except OSError as exc:
+        logger.warning("Could not give %s to the workspace's owner %s:%s: %s",
+                       path, owner[0], owner[1], exc)
 
 # Extra `docker run` flags for the AGENT container, with the same syntax and the
 # same parser as LAMBDA_DOCKER_FLAGS.
@@ -563,10 +588,12 @@ def serve_build_credentials(token):
     return 200, {"Content-Type": "application/json"}, json.dumps(session).encode()
 
 
-def _write_env_file(path, project, build):
+def _write_env_file(path, project, build, owner=None):
     env = project.get("environment", {}) or {}
     declared = {var.get("name") for var in env.get("environmentVariables") or []}
     with open(path, "w", encoding="utf-8") as fh:
+        if owner is not None:
+            _give_to_owner(owner, path)
         for var in env.get("environmentVariables") or []:
             fh.write(f"{var.get('name', '')}={var.get('value', '')}\n")
         fh.write(f"CODEBUILD_BUILD_ID={build['id']}\n")
@@ -731,12 +758,10 @@ def _timeout_seconds(project):
 
 
 def _remove_workdir(build_id, workdir):
-    """Remove one build's folder under WORKSPACE once the build has ended.
-
-    The agent and the build write into it as the build container's user, which
-    need not be the host user who owns WORKSPACE, so this MiniStack removes it
-    rather than leaving it for the host. Best effort: a build's end must not
-    fail over its cleanup."""
+    """Remove one build's folder under WORKSPACE once the build has ended, so
+    a finished build leaves nothing on the host; one a stopped run left is
+    WORKSPACE's owner's to delete (_give_to_owner). Best effort: a build's end
+    must not fail over its cleanup."""
     try:
         shutil.rmtree(workdir)
     except FileNotFoundError:
@@ -764,8 +789,10 @@ def _execute_build(build_id, project):
     compose_project = _compose_project(build_id)
 
     try:
-        for path in (source_dir, artifacts_dir, env_dir):
+        owner = _workspace_owner()
+        for path in (workdir, source_dir, artifacts_dir, env_dir):
             os.makedirs(path, exist_ok=True)
+            _give_to_owner(owner, path)
 
         buildspec = (project.get("source") or {}).get("buildspec") or ""
         if not buildspec.strip():
@@ -776,10 +803,12 @@ def _execute_build(build_id, project):
 
         buildspec_path = os.path.join(source_dir, "buildspec.yml")
         with open(buildspec_path, "w", encoding="utf-8") as fh:
+            _give_to_owner(owner, buildspec_path)
             fh.write(buildspec)
-        _write_env_file(os.path.join(env_dir, "env.list"), project, build)
+        _write_env_file(os.path.join(env_dir, "env.list"), project, build, owner)
         compose_wrapper = os.path.join(workdir, "docker-compose")
         with open(compose_wrapper, "w", encoding="utf-8") as fh:
+            _give_to_owner(owner, compose_wrapper)
             fh.write(_COMPOSE_WRAPPER)
         os.chmod(compose_wrapper, 0o755)
 

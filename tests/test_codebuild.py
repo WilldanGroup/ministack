@@ -733,6 +733,38 @@ def test_the_agent_copies_the_builds_source_rather_than_mounting_it(monkeypatch,
     assert handed["BUILDSPEC"] == str(tmp_path / "demo_0016" / "src" / "buildspec.yml")
 
 
+
+def test_what_a_build_makes_in_the_workspace_is_the_workspace_owners(monkeypatch, tmp_path):
+    """This MiniStack runs as root in its image, and the workspace is a folder of
+    the host user's bound in, so each folder it makes there is given to the
+    workspace's owner while it is still empty, and each file it writes there
+    before anything is written into it: a run stopped at any point, this
+    MiniStack killed mid-build included, leaves nothing in the workspace that
+    its owner cannot delete."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    owner = (workspace.stat().st_uid, workspace.stat().st_gid)
+    given = {}
+
+    def chown(path, uid, gid, **_kwargs):
+        path = str(path)
+        empty = not os.listdir(path) if os.path.isdir(path) else os.path.getsize(path) == 0
+        given[os.path.relpath(path, workspace)] = ((uid, gid), empty)
+
+    monkeypatch.setattr(os, "chown", chown)
+    container = _FakeContainer(["Phase complete: BUILD State: SUCCEEDED"])
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: _FakeDocker(container))
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(workspace))
+    project = _execution_project()
+    _seed_execution_build(project, "demo:0018")
+
+    codebuild._execute_build("demo:0018", project)
+
+    made = ["demo_0018", "demo_0018/src", "demo_0018/artifacts", "demo_0018/env",
+            "demo_0018/src/buildspec.yml", "demo_0018/env/env.list", "demo_0018/docker-compose"]
+    assert given == {path: (owner, True) for path in made}
+
+
 class _UnstartableContainers(_FakeContainers):
     def run(self, image, **kwargs):
         raise RuntimeError("the daemon refused the agent")
