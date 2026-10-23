@@ -712,6 +712,27 @@ def test_a_build_works_in_the_workspace_and_its_end_removes_its_folder(monkeypat
     assert not workdir.exists()
 
 
+
+def test_the_agent_copies_the_builds_source_rather_than_mounting_it(monkeypatch, tmp_path):
+    """The agent is handed the build's source to copy, as AWS's codebuild_build.sh
+    does without -m: the build works on its own copy in a volume of its own,
+    the way CodeBuild downloads a build's source onto the build's disk, and
+    never writes into the folder on the host."""
+    container = _FakeContainer(["Phase complete: BUILD State: SUCCEEDED"])
+    docker = _FakeDocker(container)
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: docker)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    project = _execution_project()
+    _seed_execution_build(project, "demo:0016")
+
+    codebuild._execute_build("demo:0016", project)
+
+    handed = docker.containers.kwargs["environment"]
+    assert "MOUNT_SOURCE_DIRECTORY" not in handed
+    assert handed["SOURCE"] == str(tmp_path / "demo_0016" / "src")
+    assert handed["BUILDSPEC"] == str(tmp_path / "demo_0016" / "src" / "buildspec.yml")
+
+
 class _UnstartableContainers(_FakeContainers):
     def run(self, image, **kwargs):
         raise RuntimeError("the daemon refused the agent")

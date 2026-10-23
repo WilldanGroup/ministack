@@ -206,7 +206,8 @@ def _make_build_record(project, build_id, source_version=None):
 # emulator reimplementing an executor.
 #
 # WORKSPACE must resolve to the same path on the host and in this container,
-# because the agent bind-mounts it into the build container. It is handed in as
+# because the agent's docker-compose binds the build's source from it, read
+# only, into the agent that copies it into the build. It is handed in as
 # MINISTACK_CODEBUILD_WORKSPACE, so two MiniStacks on one Docker daemon each
 # hand the agent a folder of their own:
 #   docker run -p 4566:4566 \
@@ -780,8 +781,12 @@ def _execute_build(build_id, project):
             environment={
                 "LOCAL_AGENT_IMAGE_NAME": AGENT_IMAGE,
                 "IMAGE_NAME": env.get("image", "aws/codebuild/standard:7.0"),
+                # The source to copy, as codebuild_build.sh hands it without
+                # -m: the build works on its own copy in a volume of its own,
+                # as CodeBuild downloads a build's source onto its own disk,
+                # and the build container, root as CodeBuild runs it, writes
+                # nothing into this folder on the host.
                 "SOURCE": source_dir,
-                "MOUNT_SOURCE_DIRECTORY": "TRUE",
                 "ARTIFACTS": artifacts_dir,
                 "BUILDSPEC": buildspec_path,
                 "ENV_VAR_FILE": "env.list",
