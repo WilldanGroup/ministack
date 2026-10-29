@@ -1867,6 +1867,38 @@ def test_appsync_evaluate_code_runs_a_handler(appsync):
     assert json.loads(out["evaluationResult"]) == {"payload": {"got": 7}}
 
 
+def test_appsync_js_util_str_normalize_takes_the_forms_appsync_documents(appsync):
+    """util.str.normalize's form is "nfc", "nfd", "nfkc" or "nfkd".
+
+    That is how AppSync's page writes it (AWS AppSync Developer Guide, String
+    helpers in util.str). The runtime handed the form to String.prototype.normalize
+    unchanged, which takes only the uppercase names, so a resolver written as the
+    page says failed as "The normalization form should be one of NFC, NFD, NFKC,
+    NFKD." The uppercase names and a missing form (NFC) answer as they did.
+    """
+    import unicodedata
+
+    text = "ﬁ Café"  # a compatibility ligature and a composed accent
+    forms = ["nfc", "nfd", "nfkc", "nfkd", "NFKD", None]
+    out = appsync.evaluate_code(
+        runtime={"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"},
+        code="""
+            import { util } from '@aws-appsync/utils'
+            export function request(ctx) {
+              return ctx.arguments.forms.map((f) =>
+                f === null ? util.str.normalize(ctx.arguments.text)
+                           : util.str.normalize(ctx.arguments.text, f))
+            }
+        """,
+        context=json.dumps({"arguments": {"text": text, "forms": forms}}),
+        function="request",
+    )
+    assert "error" not in out, out.get("error")
+    got = json.loads(out["evaluationResult"])
+    assert got == [unicodedata.normalize((f or "NFC").upper(), text) for f in forms]
+    assert len(set(got[:4])) == 4
+
+
 def test_appsync_evaluate_code_reports_a_resolver_error(appsync):
     """A resolver that raises must come back as an error, not a crash."""
     out = appsync.evaluate_code(

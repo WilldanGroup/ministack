@@ -125,7 +125,12 @@ function makeGlobals(state) {
     matches: (pattern, value) => new RegExp(pattern).test(String(value)),
     authType: () => state.authType || "API Key Authorization",
 
-    str: { normalize: (s2, form) => String(s2).normalize(form || "NFC") },
+    // AppSync documents the form as "nfc", "nfd", "nfkc" or "nfkd"; V8 takes
+    // only the uppercase names, so the case is folded before the call.
+    str: {
+      normalize: (s2, form) =>
+        String(s2).normalize(form ? String(form).toUpperCase() : "NFC"),
+    },
 
     math: {
       roundNum: (n) => Math.round(n),
