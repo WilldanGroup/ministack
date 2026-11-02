@@ -7467,6 +7467,45 @@ def test_cfn_ses_email_identity_update_keeps_its_dkim_tokens(cfn, ses, sesv2):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def _cfn_email_identity_dkim_template(uid, mail_from):
+    template = json.loads(_cfn_email_identity_template(uid, mail_from))
+    for n in (1, 2, 3):
+        for kind in ("Name", "Value"):
+            template["Outputs"][f"Dkim{kind}{n}"] = {
+                "Value": {"Fn::GetAtt": ["Ident", f"DkimDNSToken{kind}{n}"]}}
+    return json.dumps(template)
+
+
+def test_cfn_ses_email_identity_answers_its_easy_dkim_records(cfn, sesv2):
+    """A domain identity on Easy DKIM answers DkimDNSTokenName1..3 and
+    DkimDNSTokenValue1..3, the CNAME record each of its tokens needs, on
+    create and after an update; the create handler answered EmailIdentity
+    alone, so a template writing the three records into its zone failed."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ses-dkim-{uid}"
+    domain = f"cfn-{uid}.example.com"
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_email_identity_dkim_template(uid, "mail.example.com"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        tokens = sesv2.get_email_identity(EmailIdentity=domain)["DkimAttributes"]["Tokens"]
+        assert len(tokens) == 3
+        records = [(f"{t}._domainkey.{domain}", f"{t}.dkim.amazonses.com") for t in tokens]
+        assert [(_output(stack, f"DkimName{n}"), _output(stack, f"DkimValue{n}"))
+                for n in (1, 2, 3)] == records
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_email_identity_dkim_template(
+            uid, "bounces.example.com"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert [(_output(stack, f"DkimName{n}"), _output(stack, f"DkimValue{n}"))
+                for n in (1, 2, 3)] == records
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def _cfn_thing_type_template(uid, description, name=None, deprecate=None,
                              generated_name=False, searchable=("serial",),
                              mqtt5_key=None, policy=None):

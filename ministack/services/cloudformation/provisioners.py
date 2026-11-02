@@ -10747,15 +10747,19 @@ def _ses_email_identity_apply(identity, props):
         v1["DkimEnabled"] = bool(dkim["SigningEnabled"])
     _ses._identities[identity] = v1
 
+    identity_type = "DOMAIN" if "@" not in identity else "EMAIL_ADDRESS"
     v2 = _ses_v2._identities.get(identity) or {
         "EmailIdentity": identity,
-        "IdentityType": "DOMAIN" if "@" not in identity else "EMAIL_ADDRESS",
+        "IdentityType": identity_type,
         "VerifiedForSendingStatus": True,
-        "DkimAttributes": {"SigningEnabled": False, "Status": "NOT_STARTED", "Tokens": []},
+        "DkimAttributes": _ses_v2._easy_dkim_attributes(
+            identity, identity_type, props.get("DkimSigningAttributes") or {}),
         "MailFromAttributes": {"BehaviorOnMxFailure": "USE_DEFAULT_VALUE"},
         "Tags": [],
         "CreatedTimestamp": now_iso(),
     }
+    if v2["DkimAttributes"].get("Tokens") and not v1["DkimTokens"]:
+        v1["DkimTokens"] = list(v2["DkimAttributes"]["Tokens"])
     v2["DkimAttributes"] = {
         **v2["DkimAttributes"],
         "SigningEnabled": bool(dkim.get("SigningEnabled", v2["DkimAttributes"]["SigningEnabled"])),
@@ -10773,10 +10777,25 @@ def _ses_email_identity_apply(identity, props):
     return v2
 
 
+def _ses_email_identity_attributes(identity, record):
+    """The identity's return values: a domain identity on Easy DKIM answers
+    ``DkimDNSTokenName1..3`` and ``DkimDNSTokenValue1..3``, the CNAME record
+    each of its three tokens needs, ``<token>._domainkey.<domain>`` pointing
+    at ``<token>.dkim.amazonses.com``
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-ses-emailidentity.html#aws-resource-ses-emailidentity-return-values;
+    https://docs.aws.amazon.com/ses/latest/dg/send-email-authentication-dkim-easy.html).
+    An email address, or a domain bringing its own key, has no tokens."""
+    attrs = {"EmailIdentity": identity}
+    for n, token in enumerate(record["DkimAttributes"].get("Tokens") or [], start=1):
+        attrs[f"DkimDNSTokenName{n}"] = f"{token}._domainkey.{identity}"
+        attrs[f"DkimDNSTokenValue{n}"] = f"{token}.dkim.amazonses.com"
+    return attrs
+
+
 def _ses_email_identity_create(logical_id, props, stack_name):
     identity = props.get("EmailIdentity", "")
-    _ses_email_identity_apply(identity, props)
-    return identity, {"EmailIdentity": identity}
+    record = _ses_email_identity_apply(identity, props)
+    return identity, _ses_email_identity_attributes(identity, record)
 
 
 def _ses_email_identity_delete(physical_id, props):
@@ -10806,8 +10825,8 @@ def _ses_email_identity_update(physical_id, old_props, new_props, stack_name,
     )
     if replaced is not None:
         return replaced
-    _ses_email_identity_apply(identity, new_props)
-    return physical_id, {"EmailIdentity": physical_id}
+    record = _ses_email_identity_apply(identity, new_props)
+    return physical_id, _ses_email_identity_attributes(physical_id, record)
 
 
 # ---------------------------------------------------------------------------
