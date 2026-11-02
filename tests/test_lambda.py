@@ -10743,6 +10743,90 @@ def test_invoke_rie_still_retries_a_container_that_is_still_starting():
     assert "error" not in result
 
 
+class _RieLaggingLog(_RieFakeContainer):
+    """A log Docker has not handed the runtime's last line to yet at the first read."""
+
+    _FULL = (
+        b"START RequestId: r-1 Version: $LATEST\n"
+        b"2026-11-02T08:33:26.000Z\tr-1\tINFO\tbuild-observe: the handler's last line\n"
+        b"END RequestId: r-1\n"
+        b"REPORT RequestId: r-1\tDuration: 4.00 ms"
+    )
+
+    def __init__(self, held_reads=1):
+        self.reads = 0
+        self.held_reads = held_reads
+
+    def logs(self, **_kw):
+        self.reads += 1
+        if self.reads <= self.held_reads:
+            return b"START RequestId: r-1 Version: $LATEST"
+        return self._FULL
+
+
+class _RieLateEndBefore(_RieLaggingLog):
+    """The invocation before's START and END reaching the log late, beside this one's START."""
+
+    _BEFORE = b"START RequestId: r-0 Version: $LATEST\nEND RequestId: r-0\n"
+
+    def logs(self, **_kw):
+        self.reads += 1
+        if self.reads <= self.held_reads:
+            return self._BEFORE + b"START RequestId: r-1 Version: $LATEST"
+        return self._BEFORE + self._FULL
+
+
+class _RieOkResp:
+    headers = {}
+
+    def read(self):
+        return json.dumps({"ok": True}).encode()
+
+
+def test_invoke_rie_reads_the_log_through_the_invocations_end():
+    """The handler's last line reaches Docker's log after RIE has answered.
+
+    RIE writes START, the runtime's lines and END to one pipe, and Docker hands
+    them to the container's log on its own time, so a read the moment RIE
+    answers can miss the handler's last line, which then reaches no log group.
+    """
+    from ministack.services.lambda_svc import _invoke_rie
+
+    container = _RieLaggingLog()
+    with patch("urllib.request.urlopen", lambda req, timeout=None: _RieOkResp()):
+        result = _invoke_rie(container, {"k": "v"}, timeout=5)
+
+    assert result["body"] == {"ok": True}
+    assert "build-observe: the handler's last line" in result["log"]
+    assert "END RequestId: r-1" in result["log"]
+
+
+def test_invoke_rie_waits_for_its_own_end_not_the_one_before():
+    """The late lines of the invocation before end no wait: the read's last START is this one's."""
+    from ministack.services.lambda_svc import _invoke_rie
+
+    with patch("urllib.request.urlopen", lambda req, timeout=None: _RieOkResp()):
+        result = _invoke_rie(_RieLateEndBefore(), {"k": "v"}, timeout=5)
+
+    assert "build-observe: the handler's last line" in result["log"]
+
+
+def test_invoke_rie_takes_the_log_as_it_stands_when_no_end_comes():
+    """A container whose END never comes holds its caller no longer than the settle bound."""
+    from ministack.services import lambda_svc
+    from ministack.services.lambda_svc import _invoke_rie
+
+    container = _RieLaggingLog(held_reads=10**9)
+    started = time.time()
+    with patch("urllib.request.urlopen", lambda req, timeout=None: _RieOkResp()), \
+            patch.object(lambda_svc, "_RIE_LOG_SETTLE_SECONDS", 0.2):
+        result = _invoke_rie(container, {"k": "v"}, timeout=5)
+
+    assert time.time() - started < 2
+    assert result["body"] == {"ok": True}
+    assert result["log"] == "START RequestId: r-1 Version: $LATEST"
+
+
 def test_invoke_rie_does_not_re_run_a_handler_that_timed_out():
     """A read timeout means the handler ran; re-POSTing it just runs it again."""
     from ministack.services.lambda_svc import _invoke_rie

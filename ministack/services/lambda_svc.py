@@ -3922,6 +3922,32 @@ def _classify_function_error(parsed, err_header: str) -> str | None:
 # by urlopen(timeout=timeout).
 _RIE_CONNECT_RETRY_SECONDS = 30.0
 
+# RIE writes an invocation's START, the runtime's own lines and its END to the
+# one stdout pipe the runtime inherits, in that order, and Docker hands what
+# the pipe carries to the container's log on its own time: read the moment RIE
+# answers, the log may not hold the runtime's last lines yet, and a line taken
+# from neither the log nor the tail is in no log group. So the invocation's
+# lines are read through the END RIE wrote for it, waiting this long at most
+# for a container whose END never comes. The invocation's START is the last
+# the read holds, since a pooled container runs one invocation at a time and
+# a line of the one before it can only be in the read where Docker was later
+# still than this bound.
+_RIE_LOG_SETTLE_SECONDS = 2.0
+_RIE_START_RE = re.compile(r"^START RequestId: (\S+)", re.MULTILINE)
+
+
+def _rie_invocation_logs(container, since: float) -> str:
+    """The container's log from `since`, read until it holds the invocation's END."""
+    deadline = time.time() + _RIE_LOG_SETTLE_SECONDS
+    while True:
+        logs = container.logs(stdout=True, stderr=True, since=since).decode("utf-8", errors="replace").strip()
+        starts = _RIE_START_RE.findall(logs)
+        if starts and f"END RequestId: {starts[-1]}" in logs:
+            return logs
+        if time.time() >= deadline:
+            return logs
+        time.sleep(0.01)
+
 
 def _rie_failure_is_retryable(exc: BaseException) -> bool:
     """Is a failed RIE request worth retrying while the container comes up?
@@ -4040,7 +4066,7 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
                 parsed = json.loads(body)
             except json.JSONDecodeError:
                 parsed = body
-            logs = container.logs(stdout=True, stderr=True, since=invoke_time).decode("utf-8", errors="replace").strip()
+            logs = _rie_invocation_logs(container, invoke_time)
             err_header = (resp.headers.get("X-Amz-Function-Error")
                           or resp.headers.get("Lambda-Runtime-Function-Error-Type") or "")
             result = {"body": parsed, "log": logs}
