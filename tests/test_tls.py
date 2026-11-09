@@ -146,6 +146,72 @@ def test_tls_partial_cert_config_rejected():
 
 
 # ---------------------------------------------------------------------------
+# GATEWAY_HTTPS_PORT: https on a second port of its own beside the plain
+# GATEWAY_PORT, started the way the Docker ENTRYPOINT starts it (main()).
+# ---------------------------------------------------------------------------
+
+_TLS_SETTINGS = ("USE_SSL", "MINISTACK_SSL_CERT", "MINISTACK_SSL_KEY",
+                 "GATEWAY_PORT", "EDGE_PORT", "GATEWAY_HTTPS_PORT")
+
+
+def _spawn_main(env_extra: dict, tmp_path) -> subprocess.Popen:
+    env = {k: v for k, v in os.environ.items() if k not in _TLS_SETTINGS}
+    env.update({"LOG_LEVEL": "WARNING", "TMPDIR": str(tmp_path), **env_extra})
+    return subprocess.Popen(
+        [sys.executable, "-m", "ministack"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=REPO_ROOT,
+    )
+
+
+@pytest.mark.serial
+def test_https_port_serves_tls_beside_the_plain_port(tmp_path):
+    import boto3
+
+    cert, key = _byo_cert(tmp_path)
+    plain, https = _free_port(), _free_port()
+    proc = _spawn_main({
+        "GATEWAY_PORT": str(plain), "GATEWAY_HTTPS_PORT": str(https),
+        "MINISTACK_SSL_CERT": cert, "MINISTACK_SSL_KEY": key,
+    }, tmp_path)
+    try:
+        trusting = ssl.create_default_context(cafile=cert)
+        _wait_health(f"https://localhost:{https}/_ministack/health", ctx=trusting)
+        _wait_health(f"http://127.0.0.1:{plain}/_ministack/health")
+
+        sqs = boto3.client(
+            "sqs", endpoint_url=f"https://localhost:{https}", verify=cert,
+            region_name="us-east-1", aws_access_key_id="test", aws_secret_access_key="test")
+        url = sqs.create_queue(QueueName=f"https-port-{https}")["QueueUrl"]
+        assert url.startswith("http://"), url
+    finally:
+        _terminate(proc)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("given,named", [
+    ({}, "MINISTACK_SSL_CERT and MINISTACK_SSL_KEY"),
+    ({"MINISTACK_SSL_CERT": "CERT"}, "set MINISTACK_SSL_KEY."),
+    ({"MINISTACK_SSL_CERT": "CERT", "MINISTACK_SSL_KEY": "KEY", "USE_SSL": "1"}, "USE_SSL"),
+])
+def test_https_port_without_what_it_needs_is_refused_at_start(tmp_path, given, named):
+    cert, key = _byo_cert(tmp_path)
+    paths = {"CERT": cert, "KEY": key}
+    env = {name: paths.get(value, value) for name, value in given.items()}
+    proc = _spawn_main({"GATEWAY_PORT": str(_free_port()),
+                        "GATEWAY_HTTPS_PORT": str(_free_port()), **env}, tmp_path)
+    try:
+        out, _ = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        _terminate(proc)
+        pytest.fail("the server started though GATEWAY_HTTPS_PORT lacked what it needs")
+    assert proc.returncode != 0
+    assert "GATEWAY_HTTPS_PORT" in out.decode() and named in out.decode()
+
+
+# ---------------------------------------------------------------------------
 # The Cognito issuer host: a token's `iss` names
 # cognito-idp.{region}.amazonaws.com, so the gateway certificate has to as
 # well for a client that follows it to complete a handshake.

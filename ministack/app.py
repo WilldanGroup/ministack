@@ -494,6 +494,43 @@ def _resolve_port():
     return os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
 
 
+def _https_port_binding() -> "tuple[int, str, str] | None":
+    """The second, TLS-only port GATEWAY_HTTPS_PORT names, with its certificate and key.
+
+    Beside it GATEWAY_PORT stays plain HTTP, and USE_SSL stays as it is, so
+    every address a service composes in an answer keeps its scheme. None
+    where the setting is not given; a start that names the port without
+    MINISTACK_SSL_CERT and MINISTACK_SSL_KEY, or beside USE_SSL, which
+    would turn the plain port to TLS as well, is refused here, naming what
+    is missing.
+    """
+    raw = os.environ.get("GATEWAY_HTTPS_PORT", "").strip()
+    if not raw:
+        return None
+    from ministack.core import tls as _tls
+
+    def _refuse(message: str):
+        print(f"ERROR: GATEWAY_HTTPS_PORT={raw}: {message}", file=sys.stderr)
+        raise SystemExit(1)
+
+    try:
+        https_port = int(raw)
+    except ValueError:
+        _refuse("not a port number.")
+    if _tls.use_ssl_enabled():
+        _refuse("USE_SSL is set too; the https port serves TLS beside a plain GATEWAY_PORT, so unset USE_SSL.")
+    missing = [name for name in ("MINISTACK_SSL_CERT", "MINISTACK_SSL_KEY")
+               if not os.environ.get(name, "").strip()]
+    if missing:
+        _refuse(f"no certificate to serve it under; set {' and '.join(missing)}.")
+    cert = os.environ["MINISTACK_SSL_CERT"].strip()
+    key = os.environ["MINISTACK_SSL_KEY"].strip()
+    for name, path in (("MINISTACK_SSL_CERT", cert), ("MINISTACK_SSL_KEY", key)):
+        if not os.path.exists(path):
+            _refuse(f"{name} path not found: {path}")
+    return https_port, cert, key
+
+
 def _port_is_bindable(host: str, port: int) -> bool:
     """Whether `port` can be opened here: free, and permitted to this process."""
     import socket as _socket
@@ -3256,17 +3293,33 @@ def main():
         os.remove(pf)
         return
 
+    https_binding = _https_port_binding()
+
     # 0.0.0.0 binds every interface so 127.0.0.1 always works as a probe;
     # for an explicit BIND_HOST, probe that host directly.
     probe_host = "127.0.0.1" if bind_host == "0.0.0.0" else bind_host
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        if s.connect_ex((probe_host, port)) == 0:
-            print(
-                f"ERROR: {probe_host}:{port} is already in use. Is MiniStack already running?\n"
-                f"  Stop it with: ministack --stop\n"
-                f"  Or use a different port: GATEWAY_PORT=4567 ministack"
-            )
-            raise SystemExit(1)
+    for probed in [port] + ([https_binding[0]] if https_binding else []):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex((probe_host, probed)) == 0:
+                print(
+                    f"ERROR: {probe_host}:{probed} is already in use. Is MiniStack already running?\n"
+                    f"  Stop it with: ministack --stop\n"
+                    f"  Or use a different port: GATEWAY_PORT=4567 ministack"
+                )
+                raise SystemExit(1)
+
+    # Once a certificate is set, hypercorn serves `bind` under TLS and
+    # `insecure_bind` plain, each socket one or the other.
+    if https_binding:
+        https_port, certfile, keyfile = https_binding
+        bind_args = [
+            "--bind", f"{bind_host}:{https_port}",
+            "--insecure-bind", f"{bind_host}:{port}",
+            "--certfile", certfile,
+            "--keyfile", keyfile,
+        ]
+    else:
+        bind_args = ["--bind", f"{bind_host}:{port}"]
 
     if args.detach:
         log_file = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"ministack-{port}.log")
@@ -3281,8 +3334,7 @@ def main():
                 "-m",
                 "hypercorn",
                 "ministack.app:app",
-                "--bind",
-                f"{bind_host}:{port}",
+                *bind_args,
                 "--log-level",
                 LOG_LEVEL.upper(),
                 "--keep-alive",
@@ -3344,7 +3396,12 @@ def main():
         # via MINISTACK_SSL_CERT + MINISTACK_SSL_KEY.
         from ministack.core import tls as _tls
 
-        if _tls.use_ssl_enabled():
+        if https_binding:
+            # GATEWAY_HTTPS_PORT: TLS on its own socket, GATEWAY_PORT plain beside it.
+            https_port, config.certfile, config.keyfile = https_binding
+            config.bind = [f"{bind_host}:{https_port}"]
+            config.insecure_bind = [f"{bind_host}:{port}"]
+        elif _tls.use_ssl_enabled():
             config.certfile, config.keyfile = _tls.resolve_tls_material()
             # A Cognito token's `iss` is https with no port, so clients ask 443.
             if port != "443" and _port_is_bindable(bind_host, 443):
