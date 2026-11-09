@@ -1701,6 +1701,8 @@ def _execute_with_schema(api_id, sdl, query, variables, operation_name, request_
                 query=query, variables=variables, operation_name=operation_name)
         except _AuthorizerRejected:
             return _unauthorized_response()
+    if identity is None:
+        identity = _iam_identity(api, request_headers)
 
     appended = []
 
@@ -1811,6 +1813,8 @@ def _execute_graphql(api_id, data, request_headers=None):
             )
         except _AuthorizerRejected:
             return _unauthorized_response()
+    if identity is None:
+        identity = _iam_identity(api, request_headers or {})
 
     results = {}
     errors = []
@@ -2735,6 +2739,50 @@ def _oidc_identity(api, request_headers):
         "issuer": claims.get("iss"),
         "sub": claims.get("sub"),
         "sourceIp": ["127.0.0.1"],
+    }
+
+
+def _iam_identity(api, request_headers):
+    """ctx.identity for a SigV4-signed call to an API whose modes include
+    AWS_IAM, in the form AppSync documents for it (AWS AppSync Developer Guide,
+    Resolver context object reference for JavaScript, AppSyncIdentityIAM): the
+    account and ARN of the principal the signature's access key resolves to,
+    as STS's GetCallerIdentity names it, the principal's user id as its
+    username, the source address, and the four Cognito identity-pool fields
+    null, since no identity pool vended the credential. None for any other
+    call, which another mode identifies or nothing does.
+    """
+    if "AWS_IAM" not in _auth_modes(api):
+        return None
+    headers = {str(k).lower(): v for k, v in (request_headers or {}).items()}
+    if not str(headers.get("authorization") or "").startswith("AWS4-HMAC-SHA256"):
+        return None
+    from ministack.core.iam_evaluator import request_caller_arn, resolve_credential
+    from ministack.core.router import extract_access_key_id
+
+    arn = request_caller_arn(headers)
+    account = arn.split(":")[4]
+    # The username AppSync gives an IAM caller is the principal's user id, the
+    # UserId STS answers for the credential: the account's id for its root.
+    username = account
+    access_key = extract_access_key_id(headers, {})
+    if access_key:
+        try:
+            credential = resolve_credential(access_key, account)
+        except Exception:
+            credential = None
+        if (getattr(credential, "principal_arn", None) == arn
+                and getattr(credential, "principal_id", "")):
+            username = credential.principal_id
+    return {
+        "accountId": account,
+        "userArn": arn,
+        "username": username,
+        "sourceIp": ["127.0.0.1"],
+        "cognitoIdentityPoolId": None,
+        "cognitoIdentityId": None,
+        "cognitoIdentityAuthType": None,
+        "cognitoIdentityAuthProvider": None,
     }
 
 

@@ -1648,6 +1648,88 @@ def test_appsync_js_identity_comes_from_a_cognito_token(appsync, cognito_idp):
     assert out["data"]["whoami"]["sub"], "ctx.identity.sub must be populated"
 
 
+def _sigv4_graphql(api_id, query, credentials, region="us-east-1"):
+    """POST a query signed with SigV4 for appsync, as an SDK signs an AWS_IAM call."""
+    import requests as _rq
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    url = f"{_ENDPOINT}/v1/apis/{api_id}/graphql"
+    body = json.dumps({"query": query})
+    request = AWSRequest(method="POST", url=url, data=body,
+                         headers={"content-type": "application/json"})
+    if credentials is not None:
+        SigV4Auth(Credentials(*credentials), "appsync", region).add_auth(request)
+    return _rq.post(url, data=body, headers=dict(request.headers), timeout=15)
+
+
+@pytest.mark.parametrize("with_schema", [True, False], ids=["schema", "no-schema"])
+def test_appsync_js_identity_comes_from_a_sigv4_signature(appsync, iam, sts, with_schema):
+    """Under AWS_IAM a signed call reaches its resolver with its caller, as
+    AppSync hands it (AWS AppSync Developer Guide, Resolver context object
+    reference for JavaScript, AppSyncIdentityIAM): the principal's account and
+    ARN, STS's answer for the same credential, its username, the source
+    address, and the four Cognito identity-pool fields null, since no identity
+    pool vended the credential. Before, the call was admitted and ctx.identity
+    was null, so a resolver that authorizes its IAM caller refused everyone; an
+    unsigned call is refused as before."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    role_arn = iam.create_role(
+        RoleName=f"qa-appsync-iam-caller-{suffix}",
+        AssumeRolePolicyDocument=json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"},
+                           "Action": "sts:AssumeRole"}],
+        }),
+    )["Role"]["Arn"]
+    session = sts.assume_role(RoleArn=role_arn, RoleSessionName="qa-iam-caller")["Credentials"]
+    signed = (session["AccessKeyId"], session["SecretAccessKey"], session["SessionToken"])
+    caller = boto3.client(
+        "sts", endpoint_url=_ENDPOINT, region_name="us-east-1",
+        aws_access_key_id=signed[0], aws_secret_access_key=signed[1],
+        aws_session_token=signed[2],
+    ).get_caller_identity()
+
+    api_id = appsync.create_graphql_api(
+        name=f"qa-js-iam-identity-{suffix}", authenticationType="AWS_IAM",
+    )["graphqlApi"]["apiId"]
+    try:
+        if with_schema:
+            appsync.start_schema_creation(
+                apiId=api_id,
+                definition=b"schema { query: Query }\ntype Query { whoami: AWSJSON }",
+            )
+        appsync.create_data_source(apiId=api_id, name="DS", type="NONE")
+        _js_resolver(appsync, api_id, "whoami", """
+            export function request(ctx) { return { payload: ctx.identity } }
+            export function response(ctx) { return ctx.result }
+        """)
+
+        answered = _sigv4_graphql(api_id, "{ whoami }", signed)
+        assert answered.status_code == 200, answered.text
+        identity = answered.json()["data"]["whoami"]
+        if isinstance(identity, str):
+            identity = json.loads(identity)
+        assert identity is not None, "ctx.identity must be populated from the signature"
+        source_ip = identity.pop("sourceIp", None)
+        assert isinstance(source_ip, list) and source_ip and all(isinstance(ip, str) for ip in source_ip)
+        assert identity == {
+            "accountId": caller["Account"],
+            "userArn": caller["Arn"],
+            "username": caller["UserId"],
+            "cognitoIdentityPoolId": None,
+            "cognitoIdentityId": None,
+            "cognitoIdentityAuthType": None,
+            "cognitoIdentityAuthProvider": None,
+        }
+
+        unsigned = _sigv4_graphql(api_id, "{ whoami }", None)
+        assert unsigned.status_code == 401, unsigned.text
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
 class TestAppSyncOidcVerification:
     """Under AUTH an OPENID_CONNECT provider admits a bearer token only once
     it verifies as AppSync verifies it — the issuer's JWKS signature, iss, the
